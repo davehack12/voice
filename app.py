@@ -18,7 +18,9 @@ Optional environment variables (sensible defaults are used otherwise):
     KERNEL_SLUG        default: rvc-gpu-server
     CACHE_SLUG         default: rvc-cache
     DATASET            default: supporttopal/sweet-female-rvc
-    MODEL_NAME         default: sweet_female
+    MODEL_NAME         default: sweet_female     (folder name inside Applio/logs)
+    VOICE_MODEL        default: sweet_female.pth (exact filename of the .pth to load)
+    VOICE_INDEX        default: sweet_female.index
     DEFAULT_MINUTES    default: 60   (hard time limit for a run, in minutes)
     ALLOWED_ORIGIN     default: *    (set to your site's URL once you have one)
 
@@ -55,6 +57,13 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "sweet_female")
 DEFAULT_MINUTES = int(os.environ.get("DEFAULT_MINUTES", "60"))
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
 NTFY = "https://ntfy.sh"
+
+# --- hardcoded voice selection ---
+# The frontend no longer chooses the model. These two constants decide exactly
+# which .pth and .index Applio loads on every request, so we always hit the
+# small inference model and never the big training checkpoint.
+VOICE_MODEL = os.environ.get("VOICE_MODEL", "sweet_female.pth")
+VOICE_INDEX = os.environ.get("VOICE_INDEX", "sweet_female.index")
 
 TOPIC = os.environ.get("RVC_NTFY_TOPIC")
 NGROK_TOKEN = os.environ.get("NGROK_AUTHTOKEN")
@@ -170,6 +179,11 @@ try:
     say("STATUS using cached libraries" if libs else "STATUS no cache found, doing full install")
     # SETUP START
     sh(f"git clone --depth 1 https://github.com/IAHispano/Applio.git {APPLIO}")
+    # PyTorch 2.6+ defaults torch.load to weights_only=True, which refuses to
+    # unpickle RVC model files. Applio calls torch.load with weights_only=True
+    # explicitly, so patch it to False. Without this every conversion fails
+    # with "Weights only load failed. Unsupported operand 105".
+    sh("sed -i 's/weights_only=True/weights_only=False/g' /kaggle/working/Applio/rvc/infer/infer.py")
     sh("apt-get update -y")
     sh("apt-get install -y portaudio19-dev libportaudio2")
     if libs is None:
@@ -486,6 +500,9 @@ def voices():
             out = {
                 "f0_methods": infer_meta["choices"][I_INFER["f0"]] or ["rmvpe"],
                 "export_formats": infer_meta["choices"][I_INFER["fmt"]] or ["WAV"],
+                # Report the hardcoded model so the frontend shows something meaningful.
+                "model": VOICE_MODEL,
+                "index": VOICE_INDEX,
             }
             if tts_meta:
                 out["tts_voices"] = tts_meta["choices"][I_TTS["voice"]] or []
@@ -536,10 +553,10 @@ def convert():
                     args[I_INFER[key]] = bool(cfg[key])
             if "clean_strength" in cfg:
                 args[I_INFER["clean_strength"]] = float(cfg["clean_strength"])
-            if cfg.get("model"):
-                args[I_INFER["model"]] = cfg["model"]
-            if cfg.get("index"):
-                args[I_INFER["index"]] = cfg["index"]
+            # Hardcoded voice: always use what the backend was configured with,
+            # never what the frontend happens to send.
+            args[I_INFER["model"]] = VOICE_MODEL
+            args[I_INFER["index"]] = VOICE_INDEX
             return client.predict(*args, api_name=found["infer"])
 
     try:
@@ -578,10 +595,9 @@ def tts():
                 args[I_TTS["f0"]] = cfg["f0"]
             if cfg.get("fmt"):
                 args[I_TTS["fmt"]] = cfg["fmt"]
-            if cfg.get("model"):
-                args[I_TTS["model"]] = cfg["model"]
-            if cfg.get("index"):
-                args[I_TTS["index"]] = cfg["index"]
+            # Hardcoded voice, same as convert.
+            args[I_TTS["model"]] = VOICE_MODEL
+            args[I_TTS["index"]] = VOICE_INDEX
             return client.predict(*args, api_name=found["tts"])
 
     try:
