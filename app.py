@@ -8,6 +8,10 @@ Required environment variables (set these in Render's dashboard, never in code):
                        This is the private channel the Kaggle run and this backend
                        use to talk to each other. Anyone who knows it can read your
                        link and stop your run, so keep it as secret as a password.
+    NGROK_AUTHTOKEN    your ngrok authtoken, from dashboard.ngrok.com.
+                       Needed because Kaggle Secrets (UserSecretsClient) do not
+                       work in kernels pushed via the Kaggle API, so the token
+                       has to be baked into the kernel script by this backend.
 
 Optional environment variables (sensible defaults are used otherwise):
     KAGGLE_USERNAME    default: supporttopal
@@ -53,6 +57,7 @@ ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
 NTFY = "https://ntfy.sh"
 
 TOPIC = os.environ.get("RVC_NTFY_TOPIC")
+NGROK_TOKEN = os.environ.get("NGROK_AUTHTOKEN")
 KERNEL_ID = f"{KAGGLE_USERNAME}/{KERNEL_SLUG}"
 CACHE_ID = f"{KAGGLE_USERNAME}/{CACHE_SLUG}"
 DONE = {"COMPLETE", "ERROR", "CANCELACKNOWLEDGED"}
@@ -65,10 +70,11 @@ CONVERT_LOCK = threading.Lock()
 RESULTS = {}
 CLIENT_CACHE = {"url": None, "client": None, "endpoints": None}
 
-# The run script itself. Identical to the one tested locally: it listens for STOP
-# on the ntfy topic from the moment it starts (not only once Applio is up), sends a
-# heartbeat every minute, and shuts itself and every child process down on STOP or
-# once the time limit is reached.
+# The run script itself. Listens for STOP on the ntfy topic from the moment it
+# starts (not only once Applio is up), sends a heartbeat every minute, and shuts
+# itself and every child process down on STOP or once the time limit is reached.
+# The ngrok authtoken is injected by this backend as __NGROK__, because Kaggle
+# Secrets cannot be read by kernels pushed via the Kaggle API.
 KERNEL_TEMPLATE = r"""
 import glob, json, os, re, shutil, subprocess, sys, threading, time, urllib.request
 
@@ -76,6 +82,7 @@ TOPIC = "__TOPIC__"
 MAX_SECONDS = __MINUTES__ * 60
 USE_CACHE = __USE_CACHE__
 MODEL_NAME = "__MODEL_NAME__"
+NGROK_TOKEN = "__NGROK__"
 APPLIO = "/kaggle/working/Applio"
 NTFY = "https://ntfy.sh"
 started = time.time()
@@ -97,6 +104,9 @@ def sh(cmd, cwd=None):
 
 
 def stop_requested():
+    # Only look at messages posted after THIS run started. ntfy keeps a topic's
+    # message history for hours, so "since=all" would also return any old STOP
+    # left over from a previous run and cause an instant, silent shutdown.
     try:
         url = f"{NTFY}/{TOPIC}/json?poll=1&since={int(started)}"
         with urllib.request.urlopen(url, timeout=20) as r:
@@ -133,6 +143,7 @@ def kill_everything(reason):
 
 
 def watchdog():
+    # Starts before any setup, so STOP and the time limit work at every stage.
     tick = 0
     while True:
         time.sleep(15)
@@ -185,13 +196,13 @@ try:
         cwd=APPLIO, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
     )
 
+    # Give Applio time to bind port 7860 before we point a tunnel at it.
     time.sleep(30)
 
     say("STATUS opening ngrok tunnel")
-    from kaggle_secrets import UserSecretsClient
     from pyngrok import conf, ngrok
 
-    conf.get_default().auth_token = UserSecretsClient().get_secret("NGROK_AUTHTOKEN")
+    conf.get_default().auth_token = NGROK_TOKEN
     conf.get_default().monitor_thread = False
 
     existing = ngrok.get_tunnels(conf.get_default())
@@ -389,15 +400,24 @@ def get_endpoints():
 
 
 def with_reconnect(fn):
-    """Runs fn(client, found, meta) once; if it fails, drops the cached
-    connection and retries once against a freshly discovered link."""
+    """Runs fn(client, found, meta) once; on failure, drops the cached
+    connection and retries once against a freshly discovered link.
+
+    Only the *first* failure triggers the retry. If the retry also fails, the
+    original exception is re-raised so the real cause is not hidden.
+    Note that a retry here re-uploads the file and re-runs inference; this
+    wrapper should not be relied on to paper over slow operations.
+    """
     try:
         client, (found, meta), link = get_endpoints()
         return fn(client, found, meta)
-    except Exception:
+    except Exception as first:
         CLIENT_CACHE.update(url=None, client=None, endpoints=None)
-        client, (found, meta), link = get_endpoints()
-        return fn(client, found, meta)
+        try:
+            client, (found, meta), link = get_endpoints()
+            return fn(client, found, meta)
+        except Exception:
+            raise first
 
 
 # ---------- routes ----------
@@ -418,6 +438,8 @@ def status():
 def start():
     if not TOPIC:
         return fail("RVC_NTFY_TOPIC is not set on the server.", 500)
+    if not NGROK_TOKEN:
+        return fail("NGROK_AUTHTOKEN is not set on the server.", 500)
     if not shutil.which("kaggle"):
         return fail("The kaggle command is not available on this server.", 500)
     body = request.get_json(silent=True) or {}
@@ -432,7 +454,8 @@ def start():
             .replace("__TOPIC__", TOPIC)
             .replace("__MINUTES__", str(minutes))
             .replace("__USE_CACHE__", "True")
-            .replace("__MODEL_NAME__", MODEL_NAME))
+            .replace("__MODEL_NAME__", MODEL_NAME)
+            .replace("__NGROK__", NGROK_TOKEN))
     write_kernel(code, gpu=not cpu)
     rc, out = kaggle_cli("kernels", "push", "-p", str(BUILD), "-t", str(minutes * 60 + 300))
     if rc != 0:
