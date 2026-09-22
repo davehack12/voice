@@ -97,9 +97,6 @@ def sh(cmd, cwd=None):
 
 
 def stop_requested():
-    # Only look at messages posted after THIS run started. ntfy keeps a topic's
-    # message history for hours, so "since=all" would also return any old STOP
-    # left over from a previous run and cause an instant, silent shutdown.
     try:
         url = f"{NTFY}/{TOPIC}/json?poll=1&since={int(started)}"
         with urllib.request.urlopen(url, timeout=20) as r:
@@ -136,7 +133,6 @@ def kill_everything(reason):
 
 
 def watchdog():
-    # Starts before any setup, so STOP and the time limit work at every stage.
     tick = 0
     while True:
         time.sleep(15)
@@ -180,17 +176,15 @@ try:
             shutil.copy(f, dest)
             print("copied", f, flush=True)
 
-       say("STATUS installing pyngrok")
+    say("STATUS installing pyngrok")
     sh("pip install -q pyngrok")
 
     say("STATUS starting Applio")
-    # No --share: we tunnel it ourselves with ngrok.
     proc = subprocess.Popen(
         [sys.executable, "-u", "app.py", "--listen", "--client"],
         cwd=APPLIO, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
     )
 
-    # Wait for Applio to actually be listening on 7860 before tunnelling.
     time.sleep(30)
 
     say("STATUS opening ngrok tunnel")
@@ -208,7 +202,6 @@ try:
 
     say("LINK " + public_url)
 
-    # Keep a reader on Applio's stdout so its logs still show up.
     def reader():
         for line in proc.stdout:
             print(line, end="", flush=True)
