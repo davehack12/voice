@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 app.py: the whole voice changer backend, meant to run on Render (or anywhere).
 
@@ -76,7 +75,7 @@ import glob, json, os, re, shutil, subprocess, sys, threading, time, urllib.requ
 TOPIC = "__TOPIC__"
 MAX_SECONDS = __MINUTES__ * 60
 USE_CACHE = __USE_CACHE__
-MODEL_NAME = "sweet_female"
+MODEL_NAME = "__MODEL_NAME__"
 APPLIO = "/kaggle/working/Applio"
 NTFY = "https://ntfy.sh"
 started = time.time()
@@ -98,8 +97,12 @@ def sh(cmd, cwd=None):
 
 
 def stop_requested():
+    # Only look at messages posted after THIS run started. ntfy keeps a topic's
+    # message history for hours, so "since=all" would also return any old STOP
+    # left over from a previous run and cause an instant, silent shutdown.
     try:
-        with urllib.request.urlopen(f"{NTFY}/{TOPIC}/json?poll=1&since=all", timeout=20) as r:
+        url = f"{NTFY}/{TOPIC}/json?poll=1&since={int(started)}"
+        with urllib.request.urlopen(url, timeout=20) as r:
             for raw in r.read().decode("utf-8", "replace").splitlines():
                 try:
                     m = json.loads(raw)
@@ -240,7 +243,12 @@ def find_link(msgs):
     link = None
     for m in msgs:
         msg = m.get("message", "")
-        if msg.startswith("LINK "):
+        if msg == "STATUS finished":
+            # A run ended here (normal exit, STOP, time limit, or crash) - any
+            # link posted before this point belongs to that finished run, so
+            # forget it rather than showing a dead link for the next run.
+            link = None
+        elif msg.startswith("LINK "):
             link = msg[5:].strip()
     return link
 
@@ -412,7 +420,8 @@ def start():
     code = (KERNEL_TEMPLATE
             .replace("__TOPIC__", TOPIC)
             .replace("__MINUTES__", str(minutes))
-            .replace("__USE_CACHE__", "True"))
+            .replace("__USE_CACHE__", "True")
+            .replace("__MODEL_NAME__", MODEL_NAME))
     write_kernel(code, gpu=not cpu)
     rc, out = kaggle_cli("kernels", "push", "-p", str(BUILD), "-t", str(minutes * 60 + 300))
     if rc != 0:
