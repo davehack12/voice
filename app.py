@@ -180,20 +180,38 @@ try:
             shutil.copy(f, dest)
             print("copied", f, flush=True)
 
+       say("STATUS installing pyngrok")
+    sh("pip install -q pyngrok")
+
     say("STATUS starting Applio")
+    # No --share: we tunnel it ourselves with ngrok.
     proc = subprocess.Popen(
-        [sys.executable, "-u", "app.py", "--listen", "--share", "--client"],
+        [sys.executable, "-u", "app.py", "--listen", "--client"],
         cwd=APPLIO, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
     )
-    found = {"url": None}
 
+    # Wait for Applio to actually be listening on 7860 before tunnelling.
+    time.sleep(30)
+
+    say("STATUS opening ngrok tunnel")
+    from kaggle_secrets import UserSecretsClient
+    from pyngrok import conf, ngrok
+
+    conf.get_default().auth_token = UserSecretsClient().get_secret("NGROK_AUTHTOKEN")
+    conf.get_default().monitor_thread = False
+
+    existing = ngrok.get_tunnels(conf.get_default())
+    if existing:
+        public_url = existing[0].public_url
+    else:
+        public_url = ngrok.connect(7860, bind_tls=True).public_url
+
+    say("LINK " + public_url)
+
+    # Keep a reader on Applio's stdout so its logs still show up.
     def reader():
         for line in proc.stdout:
             print(line, end="", flush=True)
-            m = re.search(r"https://[a-z0-9-]+\.gradio\.live", line)
-            if m and not found["url"]:
-                found["url"] = m.group(0)
-                say("LINK " + found["url"])
 
     threading.Thread(target=reader, daemon=True).start()
 
