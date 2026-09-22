@@ -191,8 +191,9 @@ try:
     sh("pip install -q pyngrok")
 
     say("STATUS starting Applio")
+    # Force port 7860 so the tunnel target and the server always agree.
     proc = subprocess.Popen(
-        [sys.executable, "-u", "app.py", "--listen", "--client"],
+        [sys.executable, "-u", "app.py", "--listen", "--port", "7860", "--client"],
         cwd=APPLIO, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
     )
 
