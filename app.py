@@ -2,31 +2,39 @@
 app.py: the whole voice changer backend, meant to run on Render (or anywhere).
 
 Required environment variables (set these in Render's dashboard, never in code):
-    KAGGLE_API_TOKEN   your Kaggle API token, from kaggle.com/settings/api
-    RVC_NTFY_TOPIC     a long random string, e.g. output of:
-                           python3 -c "import secrets; print(secrets.token_hex(20))"
-                       This is the private channel the Kaggle run and this backend
-                       use to talk to each other. Anyone who knows it can read your
-                       link and stop your run, so keep it as secret as a password.
-    NGROK_AUTHTOKEN    your ngrok authtoken, from dashboard.ngrok.com.
-                       Needed because Kaggle Secrets (UserSecretsClient) do not
-                       work in kernels pushed via the Kaggle API, so the token
-                       has to be baked into the kernel script by this backend.
+    KAGGLE_API_TOKEN      your Kaggle API token, from kaggle.com/settings/api
+    NGROK_AUTHTOKEN       your ngrok authtoken, from dashboard.ngrok.com.
+                          Needed because Kaggle Secrets (UserSecretsClient) do not
+                          work in kernels pushed via the Kaggle API, so the token
+                          has to be baked into the kernel script by this backend.
+    RVC_NTFY_TOPIC_A      CPU slot 1 ntfy topic (long random string).
+    RVC_NTFY_TOPIC_B      CPU slot 2 ntfy topic (long random string).
+    RVC_NTFY_TOPIC_GPU    GPU slot ntfy topic (long random string).
+                          These three topics are how the Kaggle runs and this
+                          backend talk. Anyone who knows a topic can read its
+                          link and stop that run, so keep them as secret as
+                          passwords.
 
 Optional environment variables (sensible defaults are used otherwise):
-    KAGGLE_USERNAME    default: supporttopal
-    KERNEL_SLUG        default: rvc-gpu-server
-    CACHE_SLUG         default: rvc-cache
-    DATASET            default: supporttopal/sweet-female-rvc
-    MODEL_NAME         default: sweet_female     (folder name inside Applio/logs)
-    VOICE_MODEL        default: sweet_female.pth (exact filename of the .pth to load)
-    VOICE_INDEX        default: sweet_female.index
-    DEFAULT_MINUTES    default: 60   (hard time limit for a run, in minutes)
-    ALLOWED_ORIGIN     default: *    (set to your site's URL once you have one)
+    KAGGLE_USERNAME       default: supporttopal
+    KERNEL_SLUG           default: rvc-gpu-server
+    CACHE_SLUG            default: rvc-cache
+    DATASET               default: supporttopal/sweet-female-rvc
+    MODEL_NAME            default: sweet_female     (folder inside Applio/logs)
+    VOICE_MODEL           default: sweet_female.pth
+    VOICE_INDEX           default: sweet_female.index
+    ALLOWED_ORIGIN        default: *    (set to your site's URL once you have one)
+    CPU_RUN_MINUTES       default: 600  (10h; the CPU kernel's own time limit)
+    CPU_SWAP_AFTER_MIN    default: 570  (9h30m; when to push the spare CPU)
+    GPU_RUN_MINUTES       default: 40   (the GPU kernel's own time limit)
+    GPU_DAILY_RUNS        default: 6    (max GPU upgrades per rolling 24h)
+    START_ON_BOOT         default: 0    (set to 1 to auto-start a CPU run at boot)
 
 No accounts, database, or file storage are required. State is never kept only
-in this process's memory, since Render's free tier restarts it after idling,
-so every status check re-asks Kaggle and re-checks the ntfy channel directly.
+in this process's memory, since Render's free tier restarts it after idling.
+Each status check re-reads Kaggle and the ntfy topics directly, so state
+survives restarts except for the "which CPU topic is primary" choice, which
+is inferred from whichever topic has the most recent live run.
 """
 import glob
 import json
@@ -43,7 +51,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-from flask import Flask, Response, jsonify, request, send_file
+from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
 from gradio_client import Client, handle_file
 
@@ -54,19 +62,26 @@ KERNEL_SLUG = os.environ.get("KERNEL_SLUG", "rvc-gpu-server")
 CACHE_SLUG = os.environ.get("CACHE_SLUG", "rvc-cache")
 DATASET = os.environ.get("DATASET", "supporttopal/sweet-female-rvc")
 MODEL_NAME = os.environ.get("MODEL_NAME", "sweet_female")
-DEFAULT_MINUTES = int(os.environ.get("DEFAULT_MINUTES", "60"))
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
 NTFY = "https://ntfy.sh"
 
-# --- hardcoded voice selection ---
-# The frontend no longer chooses the model. These two constants decide exactly
-# which .pth and .index Applio loads on every request, so we always hit the
-# small inference model and never the big training checkpoint.
 VOICE_MODEL = os.environ.get("VOICE_MODEL", "sweet_female.pth")
 VOICE_INDEX = os.environ.get("VOICE_INDEX", "sweet_female.index")
 
-TOPIC = os.environ.get("RVC_NTFY_TOPIC")
+# Three topics, kept separate so we can tell which LINK belongs to which run.
+TOPIC_A = os.environ.get("RVC_NTFY_TOPIC_A")
+TOPIC_B = os.environ.get("RVC_NTFY_TOPIC_B")
+TOPIC_GPU = os.environ.get("RVC_NTFY_TOPIC_GPU")
+
+# Timings and limits.
+CPU_RUN_MINUTES     = int(os.environ.get("CPU_RUN_MINUTES", "600"))     # 10h
+CPU_SWAP_AFTER_MIN  = int(os.environ.get("CPU_SWAP_AFTER_MIN", "570"))  # 9h30m
+GPU_RUN_MINUTES     = int(os.environ.get("GPU_RUN_MINUTES", "40"))
+GPU_DAILY_RUNS      = int(os.environ.get("GPU_DAILY_RUNS", "6"))
+START_ON_BOOT       = os.environ.get("START_ON_BOOT", "0") == "1"
+
 NGROK_TOKEN = os.environ.get("NGROK_AUTHTOKEN")
+
 KERNEL_ID = f"{KAGGLE_USERNAME}/{KERNEL_SLUG}"
 CACHE_ID = f"{KAGGLE_USERNAME}/{CACHE_SLUG}"
 DONE = {"COMPLETE", "ERROR", "CANCELACKNOWLEDGED"}
@@ -75,15 +90,45 @@ BUILD = WORK / "kernel_build"
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGIN}})
+
 CONVERT_LOCK = threading.Lock()
 RESULTS = {}
 CLIENT_CACHE = {"url": None, "client": None, "endpoints": None}
 
-# The run script itself. Listens for STOP on the ntfy topic from the moment it
-# starts (not only once Applio is up), sends a heartbeat every minute, and shuts
-# itself and every child process down on STOP or once the time limit is reached.
-# The ngrok authtoken is injected by this backend as __NGROK__, because Kaggle
-# Secrets cannot be read by kernels pushed via the Kaggle API.
+# ---------- runtime state ----------
+#
+# SLOTS describes every topic we manage. The CPU rotator alternates between
+# cpu_a and cpu_b. The GPU is separate.
+#
+# For each slot we track:
+#   topic           the ntfy topic string
+#   kind            "cpu" or "gpu"
+#   pushed_at       unix time when we last pushed a kernel to this slot (0 = never)
+#   push_lock       ensures we never double-push
+#   last_link_seen  the last LINK value we observed on this topic
+#
+# `link` is not stored here; it is recomputed on every status call by reading
+# the topic's ntfy history. That way a backend restart does not lose the fact
+# that a run is alive.
+
+SLOTS = [
+    {"id": "cpu_a", "kind": "cpu", "topic": TOPIC_A, "pushed_at": 0, "push_lock": threading.Lock()},
+    {"id": "cpu_b", "kind": "cpu", "topic": TOPIC_B, "pushed_at": 0, "push_lock": threading.Lock()},
+    {"id": "gpu",   "kind": "gpu", "topic": TOPIC_GPU, "pushed_at": 0, "push_lock": threading.Lock()},
+]
+SLOT_BY_ID = {s["id"]: s for s in SLOTS}
+
+# Rolling 24h log of GPU upgrade timestamps, so we can enforce the daily cap.
+UPGRADE_LOG = []
+UPGRADE_LOG_LOCK = threading.Lock()
+
+# Tracks which CPU slot is currently primary. Recomputed on every status call
+# based on which CPU slot has the most recent live run.
+CPU_PRIMARY_ID = None
+
+# The run script itself. Listens for STOP on its own topic from the moment it
+# starts, sends a heartbeat every minute, and shuts itself and every child
+# process down on STOP or once the time limit is reached.
 KERNEL_TEMPLATE = r"""
 import glob, json, os, re, shutil, subprocess, sys, threading, time, urllib.request
 
@@ -152,7 +197,6 @@ def kill_everything(reason):
 
 
 def watchdog():
-    # Starts before any setup, so STOP and the time limit work at every stage.
     tick = 0
     while True:
         time.sleep(15)
@@ -177,12 +221,9 @@ if USE_CACHE:
 
 try:
     say("STATUS using cached libraries" if libs else "STATUS no cache found, doing full install")
-    # SETUP START
     sh(f"git clone --depth 1 https://github.com/IAHispano/Applio.git {APPLIO}")
     # PyTorch 2.6+ defaults torch.load to weights_only=True, which refuses to
-    # unpickle RVC model files. Applio calls torch.load with weights_only=True
-    # explicitly, so patch it to False. Without this every conversion fails
-    # with "Weights only load failed. Unsupported operand 105".
+    # unpickle RVC model files. Patch it to False for our inference path.
     sh("sed -i 's/weights_only=True/weights_only=False/g' /kaggle/working/Applio/rvc/infer/infer.py")
     sh("apt-get update -y")
     sh("apt-get install -y portaudio19-dev libportaudio2")
@@ -191,7 +232,6 @@ try:
         sh("uv pip install -q -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128 --index-strategy unsafe-best-match --system", cwd=APPLIO)
     say("STATUS downloading Applio models")
     sh(f"{sys.executable} core.py prerequisites --models", cwd=APPLIO)
-    # SETUP END
 
     say("STATUS copying voice files")
     dest = f"{APPLIO}/logs/{MODEL_NAME}"
@@ -205,13 +245,11 @@ try:
     sh("pip install -q pyngrok")
 
     say("STATUS starting Applio")
-    # Force port 7860 so the tunnel target and the server always agree.
     proc = subprocess.Popen(
         [sys.executable, "-u", "app.py", "--listen", "--port", "7860", "--client"],
         cwd=APPLIO, env=ENV, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
     )
 
-    # Give Applio time to bind port 7860 before we point a tunnel at it.
     time.sleep(30)
 
     say("STATUS opening ngrok tunnel")
@@ -253,8 +291,8 @@ def fail(message, code=400):
 
 # ---------- ntfy + kaggle helpers ----------
 
-def ntfy_read(topic):
-    url = f"{NTFY}/{topic}/json?poll=1&since=all"
+def ntfy_read(topic, since_all=True):
+    url = f"{NTFY}/{topic}/json?poll=1&since=all" if since_all else f"{NTFY}/{topic}/json?poll=1"
     try:
         with urllib.request.urlopen(url, timeout=20) as r:
             text = r.read().decode("utf-8", "replace")
@@ -277,17 +315,23 @@ def ntfy_send(topic, text):
 
 
 def find_link(msgs):
+    """Return the live link for a topic, or None if the run has finished.
+
+    A LINK followed by a STATUS finished means that run is over; we forget the
+    link at that point so a stale tunnel is never reused.
+    """
     link = None
     for m in msgs:
         msg = m.get("message", "")
         if msg == "STATUS finished":
-            # A run ended here (normal exit, STOP, time limit, or crash) - any
-            # link posted before this point belongs to that finished run, so
-            # forget it rather than showing a dead link for the next run.
             link = None
         elif msg.startswith("LINK "):
             link = msg[5:].strip()
     return link
+
+
+def last_message(msgs):
+    return msgs[-1] if msgs else None
 
 
 def kaggle_cli(*args):
@@ -335,19 +379,243 @@ def write_kernel(code, gpu):
     (BUILD / "kernel-metadata.json").write_text(json.dumps(meta, indent=2))
 
 
-def current_status():
-    s = run_state()
-    msgs = ntfy_read(TOPIC) if TOPIC else []
-    link = find_link(msgs)
-    last = msgs[-1] if msgs else None
-    age = int(time.time() - last["time"]) if last else None
+# ---------- slot bookkeeping ----------
+
+def build_kernel_code(topic, minutes):
+    return (KERNEL_TEMPLATE
+            .replace("__TOPIC__", topic)
+            .replace("__MINUTES__", str(minutes))
+            .replace("__USE_CACHE__", "True")
+            .replace("__MODEL_NAME__", MODEL_NAME)
+            .replace("__NGROK__", NGROK_TOKEN or ""))
+
+
+def push_slot(slot, minutes, gpu):
+    """Push a kernel to a slot. Returns (ok, info) where info is a dict with
+    either an error message or the kaggle output. Never raises."""
+    if not NGROK_TOKEN:
+        return False, {"error": "NGROK_AUTHTOKEN is not set on the server."}
+    if not slot["topic"]:
+        return False, {"error": f"Topic for slot {slot['id']} is not set."}
+    if not shutil.which("kaggle"):
+        return False, {"error": "The kaggle command is not available on this server."}
+
+    with slot["push_lock"]:
+        code = build_kernel_code(slot["topic"], minutes)
+        write_kernel(code, gpu=gpu)
+        rc, out = kaggle_cli("kernels", "push", "-p", str(BUILD),
+                             "-t", str(minutes * 60 + 300))
+        if rc != 0:
+            return False, {"error": f"Kaggle push failed: {out}"}
+        slot["pushed_at"] = int(time.time())
+        return True, {"kaggle_output": out}
+
+
+def slot_link(slot):
+    """Read the slot's topic and return its current live link, or None."""
+    if not slot["topic"]:
+        return None
+    msgs = ntfy_read(slot["topic"])
+    return find_link(msgs)
+
+
+def slot_last_message(slot):
+    if not slot["topic"]:
+        return None
+    msgs = ntfy_read(slot["topic"])
+    last = last_message(msgs)
+    return last["message"] if last else None
+
+
+def slot_state_dict(slot):
+    link = slot_link(slot)
+    pushed = slot["pushed_at"]
+    age = int(time.time() - pushed) if pushed else None
     return {
-        "kaggle_state": s,
-        "active": is_active(s),
-        "link": link if is_active(s) else None,
-        "last_message": last["message"] if last else None,
-        "last_message_age_seconds": age,
+        "id": slot["id"],
+        "kind": slot["kind"],
+        "link": link,
+        "pushed_at": pushed or None,
+        "age_seconds": age,
+        "last_message": slot_last_message(slot),
     }
+
+
+def record_gpu_upgrade():
+    """Returns (allowed, remaining_today). Records the timestamp if allowed."""
+    now = time.time()
+    with UPGRADE_LOG_LOCK:
+        cutoff = now - 24 * 3600
+        UPGRADE_LOG[:] = [t for t in UPGRADE_LOG if t > cutoff]
+        if len(UPGRADE_LOG) >= GPU_DAILY_RUNS:
+            return False, GPU_DAILY_RUNS - len(UPGRADE_LOG)
+        UPGRADE_LOG.append(now)
+        return True, GPU_DAILY_RUNS - len(UPGRADE_LOG)
+
+
+def upgrades_remaining():
+    now = time.time()
+    with UPGRADE_LOG_LOCK:
+        cutoff = now - 24 * 3600
+        UPGRADE_LOG[:] = [t for t in UPGRADE_LOG if t > cutoff]
+        return GPU_DAILY_RUNS - len(UPGRADE_LOG)
+
+
+# ---------- current status ----------
+
+def current_status():
+    cpu_a = SLOT_BY_ID["cpu_a"]
+    cpu_b = SLOT_BY_ID["cpu_b"]
+    gpu   = SLOT_BY_ID["gpu"]
+
+    state_a = slot_state_dict(cpu_a)
+    state_b = slot_state_dict(cpu_b)
+    state_g   = slot_state_dict(gpu)
+
+    # CPU primary: the CPU slot whose run was pushed most recently AND has a
+    # live link. If both have links (brief overlap during a swap), the one
+    # pushed most recently wins. If neither has a link, fall back to whichever
+    # has the most recent push.
+    cpu_candidates = [s for s in (state_a, state_b) if s["link"]]
+    if cpu_candidates:
+        cpu_primary = max(cpu_candidates, key=lambda s: s["pushed_at"] or 0)
+    else:
+        cpu_primary = max((state_a, state_b), key=lambda s: s["pushed_at"] or 0)
+
+    # GPU wins as the reported link whenever it has a live link.
+    gpu_live = bool(state_g["link"])
+    if gpu_live:
+        primary = "gpu"
+        link = state_g["link"]
+    else:
+        primary = "cpu"
+        link = cpu_primary["link"]
+
+    kaggle = run_state()
+
+    # The CPU spare is a booting run on the non-primary CPU slot.
+    cpu_spare = state_b if cpu_primary["id"] == "cpu_a" else state_a
+    if cpu_spare["link"]:
+        cpu_spare_state = "ready"
+    elif cpu_spare["pushed_at"]:
+        cpu_spare_state = "booting"
+    else:
+        cpu_spare_state = "idle"
+
+    if gpu_live:
+        gpu_state = "ready"
+    elif state_g["pushed_at"]:
+        gpu_state = "booting"
+    else:
+        gpu_state = "idle"
+
+    # last_message reported to the frontend is whichever run is primary.
+    if primary == "gpu":
+        last_msg = state_g["last_message"]
+    else:
+        last_msg = cpu_primary["last_message"]
+
+    return {
+        "kaggle_state": kaggle,
+        "active": is_active(kaggle) or bool(link),
+        "link": link,
+        "primary": primary,
+        "cpu_primary_age_min": (
+            int(cpu_primary["age_seconds"] / 60) if cpu_primary["age_seconds"] else None
+        ),
+        "cpu_spare_state": cpu_spare_state,
+        "gpu_state": gpu_state,
+        "gpu_upgrades_remaining": upgrades_remaining(),
+        "gpu_upgrades_per_day": GPU_DAILY_RUNS,
+        "last_message": last_msg,
+        "last_message_age_seconds": None,
+    }
+
+
+# ---------- background threads ----------
+
+def cpu_rotator():
+    """Every 60s: make sure a CPU run is alive, and rotate before the cap."""
+    while True:
+        try:
+            if TOPIC_A and TOPIC_B:
+                cpu_a = SLOT_BY_ID["cpu_a"]
+                cpu_b = SLOT_BY_ID["cpu_b"]
+                state_a = slot_state_dict(cpu_a)
+                state_b = slot_state_dict(cpu_b)
+
+                cpu_candidates = [s for s in (state_a, state_b) if s["link"]]
+                if cpu_candidates:
+                    cpu_primary = max(cpu_candidates, key=lambda s: s["pushed_at"] or 0)
+                else:
+                    cpu_primary = max((state_a, state_b), key=lambda s: s["pushed_at"] or 0)
+
+                spare_id = "cpu_b" if cpu_primary["id"] == "cpu_a" else "cpu_a"
+                spare = SLOT_BY_ID[spare_id]
+                spare_state = slot_state_dict(spare)
+
+                primary_age_min = (
+                    int((cpu_primary["age_seconds"] or 0) / 60)
+                    if cpu_primary["age_seconds"] else 0
+                )
+
+                # If no CPU run at all, push one to the primary slot.
+                if not cpu_primary["link"] and not spare_state["pushed_at"]:
+                    push_slot(cpu_primary_slot(), CPU_RUN_MINUTES, gpu=False)
+
+                # If primary is past the swap threshold and the spare hasn't
+                # been pushed, push the spare.
+                elif (primary_age_min >= CPU_SWAP_AFTER_MIN
+                      and not spare_state["pushed_at"]
+                      and not spare_state["link"]):
+                    push_slot(spare, CPU_RUN_MINUTES, gpu=False)
+
+                # If spare is live, promote and kill the old primary.
+                elif spare_state["link"]:
+                    # STOP the old primary
+                    try:
+                        ntfy_send(cpu_primary["topic"], "STOP")
+                    except Exception:
+                        pass
+                    # The new primary is the spare. current_status() will pick
+                    # it up automatically because its pushed_at is newer.
+        except Exception:
+            pass
+        time.sleep(60)
+
+
+def cpu_primary_slot():
+    """Return the CPU slot that should be considered primary right now."""
+    cpu_a = SLOT_BY_ID["cpu_a"]
+    cpu_b = SLOT_BY_ID["cpu_b"]
+    state_a = slot_state_dict(cpu_a)
+    state_b = slot_state_dict(cpu_b)
+    cpu_candidates = [s for s in (state_a, state_b) if s["link"]]
+    if cpu_candidates:
+        winner = max(cpu_candidates, key=lambda s: s["pushed_at"] or 0)
+    else:
+        winner = max((state_a, state_b), key=lambda s: s["pushed_at"] or 0)
+    return SLOT_BY_ID[winner["id"]]
+
+
+def gpu_watchdog():
+    """Every 60s: kill the GPU run once it has lived GPU_RUN_MINUTES."""
+    while True:
+        try:
+            gpu = SLOT_BY_ID["gpu"]
+            pushed = gpu["pushed_at"]
+            if pushed and TOPIC_GPU:
+                elapsed_min = int((time.time() - pushed) / 60)
+                if elapsed_min >= GPU_RUN_MINUTES:
+                    # send STOP; the kernel watchdog handles the actual shutdown.
+                    try:
+                        ntfy_send(gpu["topic"], "STOP")
+                    except Exception:
+                        pass
+                    gpu["pushed_at"] = 0
+        except Exception:
+            pass
+        time.sleep(60)
 
 
 # ---------- Applio proxy (inference + text to speech) ----------
@@ -369,7 +637,6 @@ def as_value(x):
 
 
 def parse_literal_choices(type_str):
-    """gradio_client reports a Dropdown's options as a `Literal['a', 'b']` type string."""
     if not type_str or not type_str.startswith("Literal["):
         return None
     return re.findall(r"'([^']*)'", type_str) or None
@@ -400,8 +667,6 @@ def discover(client):
 
 
 def get_endpoints():
-    """Reuses a live connection if we already have one; otherwise reconnects
-    using whatever link is posted on the ntfy channel right now."""
     st = current_status()
     link = st["link"]
     if not link:
@@ -415,14 +680,6 @@ def get_endpoints():
 
 
 def with_reconnect(fn):
-    """Runs fn(client, found, meta) once; on failure, drops the cached
-    connection and retries once against a freshly discovered link.
-
-    Only the *first* failure triggers the retry. If the retry also fails, the
-    original exception is re-raised so the real cause is not hidden.
-    Note that a retry here re-uploads the file and re-runs inference; this
-    wrapper should not be relied on to paper over slow operations.
-    """
     try:
         client, (found, meta), link = get_endpoints()
         return fn(client, found, meta)
@@ -444,51 +701,79 @@ def home():
 
 @app.get("/api/status")
 def status():
-    if not TOPIC:
-        return fail("RVC_NTFY_TOPIC is not set on the server.", 500)
+    if not TOPIC_A or not TOPIC_B or not TOPIC_GPU:
+        return fail("One or more RVC_NTFY_TOPIC_* variables are missing.", 500)
     return jsonify(ok=True, **current_status())
 
 
 @app.post("/api/start")
 def start():
-    if not TOPIC:
-        return fail("RVC_NTFY_TOPIC is not set on the server.", 500)
-    if not NGROK_TOKEN:
-        return fail("NGROK_AUTHTOKEN is not set on the server.", 500)
-    if not shutil.which("kaggle"):
-        return fail("The kaggle command is not available on this server.", 500)
-    body = request.get_json(silent=True) or {}
-    cpu = bool(body.get("cpu", False))
-    minutes = int(body.get("minutes", DEFAULT_MINUTES))
+    """Start or ensure a CPU run. If one is already live or booting, this is
+    a no-op. Idempotent so the frontend can call it freely."""
+    if not TOPIC_A or not TOPIC_B or not TOPIC_GPU:
+        return fail("One or more RVC_NTFY_TOPIC_* variables are missing.", 500)
 
-    st = current_status()
-    if st["active"]:
-        return jsonify(ok=True, already_running=True, **st)
+    cpu_a = SLOT_BY_ID["cpu_a"]
+    cpu_b = SLOT_BY_ID["cpu_b"]
+    state_a = slot_state_dict(cpu_a)
+    state_b = slot_state_dict(cpu_b)
 
-    code = (KERNEL_TEMPLATE
-            .replace("__TOPIC__", TOPIC)
-            .replace("__MINUTES__", str(minutes))
-            .replace("__USE_CACHE__", "True")
-            .replace("__MODEL_NAME__", MODEL_NAME)
-            .replace("__NGROK__", NGROK_TOKEN))
-    write_kernel(code, gpu=not cpu)
-    rc, out = kaggle_cli("kernels", "push", "-p", str(BUILD), "-t", str(minutes * 60 + 300))
-    if rc != 0:
-        return fail(f"Kaggle push failed: {out}", 500)
-    return jsonify(ok=True, already_running=False, message="Push submitted. Poll /api/status for the link.",
-                   kaggle_output=out)
+    if state_a["link"] or state_b["link"] or state_a["pushed_at"] or state_b["pushed_at"]:
+        # A CPU run is already live or booting.
+        return jsonify(ok=True, already_running=True, **current_status())
+
+    ok, info = push_slot(cpu_primary_slot(), CPU_RUN_MINUTES, gpu=False)
+    if not ok:
+        return fail(info.get("error", "Push failed"), 500)
+    return jsonify(ok=True, already_running=False,
+                   message="CPU push submitted. Poll /api/status for the link.",
+                   kaggle_output=info.get("kaggle_output"))
 
 
 @app.post("/api/stop")
 def stop():
-    if not TOPIC:
-        return fail("RVC_NTFY_TOPIC is not set on the server.", 500)
-    st = current_status()
-    if not st["active"]:
-        return jsonify(ok=True, message=f"Nothing is running (Kaggle state: {st['kaggle_state']}).", **st)
-    ntfy_send(TOPIC, "STOP")
+    """Stop everything: CPU and GPU. Used for a hard shutdown."""
+    if not TOPIC_A or not TOPIC_B or not TOPIC_GPU:
+        return fail("One or more RVC_NTFY_TOPIC_* variables are missing.", 500)
+
+    for slot in SLOTS:
+        try:
+            ntfy_send(slot["topic"], "STOP")
+            slot["pushed_at"] = 0
+        except Exception:
+            pass
     CLIENT_CACHE.update(url=None, client=None, endpoints=None)
-    return jsonify(ok=True, message="Stop signal sent. Poll /api/status to see it end.")
+    return jsonify(ok=True, message="Stop signal sent to all slots.")
+
+
+@app.post("/api/upgrade-gpu")
+def upgrade_gpu():
+    """Push a GPU run. The 40-minute cap starts immediately at push time. All
+    users then share the GPU link while it is live."""
+    if not TOPIC_GPU:
+        return fail("RVC_NTFY_TOPIC_GPU is not set on the server.", 500)
+
+    gpu = SLOT_BY_ID["gpu"]
+    state_g = slot_state_dict(gpu)
+
+    # Already live or booting? No-op.
+    if state_g["link"] or gpu["pushed_at"]:
+        return jsonify(ok=True, already_running=True,
+                       message="GPU is already running or booting.",
+                       **current_status())
+
+    allowed, remaining = record_gpu_upgrade()
+    if not allowed:
+        return fail(f"Daily GPU limit reached. Try again later. Remaining: {remaining}.", 429)
+
+    ok, info = push_slot(gpu, GPU_RUN_MINUTES, gpu=True)
+    if not ok:
+        return fail(info.get("error", "GPU push failed"), 500)
+
+    return jsonify(ok=True, already_running=False,
+                   message="GPU push submitted. The 40-minute window starts now.",
+                   gpu_upgrades_remaining=remaining,
+                   kaggle_output=info.get("kaggle_output"))
 
 
 @app.get("/api/voices")
@@ -500,7 +785,6 @@ def voices():
             out = {
                 "f0_methods": infer_meta["choices"][I_INFER["f0"]] or ["rmvpe"],
                 "export_formats": infer_meta["choices"][I_INFER["fmt"]] or ["WAV"],
-                # Report the hardcoded model so the frontend shows something meaningful.
                 "model": VOICE_MODEL,
                 "index": VOICE_INDEX,
             }
@@ -553,8 +837,6 @@ def convert():
                     args[I_INFER[key]] = bool(cfg[key])
             if "clean_strength" in cfg:
                 args[I_INFER["clean_strength"]] = float(cfg["clean_strength"])
-            # Hardcoded voice: always use what the backend was configured with,
-            # never what the frontend happens to send.
             args[I_INFER["model"]] = VOICE_MODEL
             args[I_INFER["index"]] = VOICE_INDEX
             return client.predict(*args, api_name=found["infer"])
@@ -595,7 +877,6 @@ def tts():
                 args[I_TTS["f0"]] = cfg["f0"]
             if cfg.get("fmt"):
                 args[I_TTS["fmt"]] = cfg["fmt"]
-            # Hardcoded voice, same as convert.
             args[I_TTS["model"]] = VOICE_MODEL
             args[I_TTS["index"]] = VOICE_INDEX
             return client.predict(*args, api_name=found["tts"])
@@ -626,6 +907,25 @@ def result(rid):
     mime = mimetypes.guess_type(str(p))[0] or "audio/wav"
     return send_file(p, mimetype=mime, as_attachment=bool(request.args.get("dl")),
                      download_name=f"converted_{rid}{p.suffix}")
+
+
+# ---------- boot ----------
+
+def _boot():
+    if START_ON_BOOT:
+        try:
+            time.sleep(5)
+            cpu_primary = cpu_primary_slot()
+            state = slot_state_dict(cpu_primary)
+            if not state["link"] and not state["pushed_at"]:
+                push_slot(cpu_primary, CPU_RUN_MINUTES, gpu=False)
+        except Exception:
+            pass
+
+
+threading.Thread(target=cpu_rotator, daemon=True).start()
+threading.Thread(target=gpu_watchdog, daemon=True).start()
+threading.Thread(target=_boot, daemon=True).start()
 
 
 if __name__ == "__main__":
