@@ -22,6 +22,8 @@ Optional environment variables (sensible defaults are used otherwise):
     GPU_RUN_MINUTES       default: 40
     GPU_DAILY_RUNS        default: 6
     START_ON_BOOT         default: 0
+    STATUS_TTL_SECONDS    default: 8     (how long a status response is cached)
+    NTFY_HISTORY_SECONDS  default: 43200 (12h; how much topic history we pull)
 """
 import glob
 import json
@@ -64,6 +66,8 @@ CPU_SWAP_AFTER_MIN  = int(os.environ.get("CPU_SWAP_AFTER_MIN", "570"))
 GPU_RUN_MINUTES     = int(os.environ.get("GPU_RUN_MINUTES", "40"))
 GPU_DAILY_RUNS      = int(os.environ.get("GPU_DAILY_RUNS", "6"))
 START_ON_BOOT       = os.environ.get("START_ON_BOOT", "0") == "1"
+STATUS_TTL_SECONDS  = int(os.environ.get("STATUS_TTL_SECONDS", "8"))
+NTFY_HISTORY_SECONDS = int(os.environ.get("NTFY_HISTORY_SECONDS", "43200"))
 
 NGROK_TOKEN = os.environ.get("NGROK_AUTHTOKEN")
 
@@ -81,10 +85,6 @@ RESULTS = {}
 CLIENT_CACHE = {"url": None, "client": None, "endpoints": None}
 
 # ---------- runtime state ----------
-#
-# Every write to a slot's pushed_at or a "we already handled this" flag goes
-# through SLOTS_LOCK. Without it, the rotator and the /api/start handler race
-# each other and can both decide to push.
 
 SLOTS_LOCK = threading.Lock()
 
@@ -100,6 +100,19 @@ SLOT_BY_ID = {s["id"]: s for s in SLOTS}
 
 UPGRADE_LOG = []
 UPGRADE_LOG_LOCK = threading.Lock()
+
+# ---------- status cache ----------
+#
+# current_status() costs four outbound calls: three ntfy reads plus a kaggle
+# CLI subprocess. Doing that per /api/status hit means every polling browser
+# tab triggers four requests every 10s, which queues up on Render's free tier
+# and makes the endpoint feel stuck.
+#
+# Cache the computed dict for a short window and serve everyone from the
+# cached copy. Invalidation is by TTL only; nothing else has to know.
+STATUS_CACHE = {"at": 0.0, "value": None}
+STATUS_CACHE_LOCK = threading.Lock()
+
 
 KERNEL_TEMPLATE = r"""
 import glob, json, os, re, shutil, subprocess, sys, threading, time, urllib.request
@@ -259,7 +272,15 @@ def fail(message, code=400):
 # ---------- ntfy + kaggle helpers ----------
 
 def ntfy_read(topic):
-    url = f"{NTFY}/{topic}/json?poll=1&since=all"
+    """Read recent messages from a topic.
+
+    Pulling `since=all` meant the response grew every time a kernel ran, and
+    the backend parsed weeks of dead runs on every status call. We only ever
+    care about the current run, so cap the window. NTFY_HISTORY_SECONDS
+    defaults to 12 hours, which covers the longest allowed run.
+    """
+    since_ts = int(time.time() - NTFY_HISTORY_SECONDS)
+    url = f"{NTFY}/{topic}/json?poll=1&since={since_ts}"
     try:
         with urllib.request.urlopen(url, timeout=20) as r:
             text = r.read().decode("utf-8", "replace")
@@ -353,10 +374,7 @@ def build_kernel_code(topic, minutes):
 
 
 def push_slot(slot, minutes, gpu):
-    """Push a kernel to a slot. Returns (ok, info). Never raises.
-
-    Acquires SLOTS_LOCK so a concurrent /api/start and rotator tick can't both
-    decide to push the same slot."""
+    """Push a kernel to a slot. Returns (ok, info). Never raises."""
     if not NGROK_TOKEN:
         return False, {"error": "NGROK_AUTHTOKEN is not set on the server."}
     if not slot["topic"]:
@@ -366,7 +384,6 @@ def push_slot(slot, minutes, gpu):
 
     with SLOTS_LOCK:
         with slot["push_lock"]:
-            # Double-check: if something else pushed a moment ago, skip.
             if slot["pushed_at"]:
                 return False, {"error": "This slot was already pushed recently."}
             code = build_kernel_code(slot["topic"], minutes)
@@ -431,12 +448,6 @@ def upgrades_remaining():
 # ---------- current status ----------
 
 def _pick_cpu_primary(state_a, state_b):
-    """Return the state dict of the CPU slot that should be considered primary.
-
-    Rule: among slots with a live link, the most recently pushed wins. If none
-    have a link, the most recently pushed slot wins (even if its run has died,
-    we don't want to instantly promote an idle slot).
-    """
     live = [s for s in (state_a, state_b) if s["link"]]
     pool = live or [state_a, state_b]
     return max(pool, key=lambda s: s["pushed_at"] or 0)
@@ -452,6 +463,7 @@ def current_status():
     state_g = slot_state_dict(gpu)
 
     cpu_primary = _pick_cpu_primary(state_a, state_b)
+    cpu_spare = state_b if cpu_primary["id"] == "cpu_a" else state_a
 
     gpu_live = bool(state_g["link"])
     if gpu_live:
@@ -463,7 +475,10 @@ def current_status():
 
     kaggle = run_state()
 
-    cpu_spare = state_b if cpu_primary["id"] == "cpu_a" else state_a
+    # Spare state, from the caller's point of view:
+    #   idle    -- never pushed, or stopped
+    #   booting -- pushed, no LINK yet
+    #   ready   -- LINK is live
     if cpu_spare["link"]:
         cpu_spare_state = "ready"
     elif cpu_spare["pushed_at"]:
@@ -478,11 +493,23 @@ def current_status():
     else:
         gpu_state = "idle"
 
+    # Top-level server state, for the frontend. One field, one meaning:
+    #   "online"  -- a link is live and requests will succeed
+    #   "booting" -- a push happened, waiting on LINK
+    #   "idle"    -- nothing is running and nothing is booting
+    if link:
+        server_state = "online"
+    elif cpu_primary["pushed_at"] or cpu_spare["pushed_at"] or state_g["pushed_at"]:
+        server_state = "booting"
+    else:
+        server_state = "idle"
+
     last_msg = state_g["last_message"] if primary == "gpu" else cpu_primary["last_message"]
 
     return {
         "kaggle_state": kaggle,
-        "active": is_active(kaggle) or bool(link),
+        "active": is_active(kaggle) or bool(link) or server_state == "booting",
+        "server_state": server_state,
         "link": link,
         "primary": primary,
         "cpu_primary_age_min": (
@@ -497,6 +524,29 @@ def current_status():
     }
 
 
+def cached_status():
+    """Serve a cached status for STATUS_TTL_SECONDS.
+
+    current_status() makes four outbound calls. Doing that per request queues
+    up on Render's free tier because every polling tab is one caller. One
+    computation per TTL, shared by all callers, fixes it.
+    """
+    now = time.time()
+    with STATUS_CACHE_LOCK:
+        value = STATUS_CACHE["value"]
+        at = STATUS_CACHE["at"]
+        if value is not None and (now - at) < STATUS_TTL_SECONDS:
+            return value
+
+    # Compute outside the lock so a slow call doesn't block other readers.
+    fresh = current_status()
+
+    with STATUS_CACHE_LOCK:
+        STATUS_CACHE["at"] = time.time()
+        STATUS_CACHE["value"] = fresh
+    return fresh
+
+
 # ---------- background threads ----------
 
 def _cpu_states():
@@ -505,14 +555,7 @@ def _cpu_states():
 
 
 def cpu_rotator():
-    """Every 60s: make sure one CPU run is alive, and rotate before the cap.
-
-    The three branches are mutually exclusive on any given tick:
-      A. neither slot has a live link and neither has a pending push  -> push one
-      B. primary is past CPU_SWAP_AFTER_MIN and spare has no push yet -> push spare
-      C. spare has a live link and we haven't stopped the old primary  -> stop old
-    Once a slot is stopped, stop_sent=True keeps us from stopping it again.
-    """
+    """Every 60s: make sure one CPU run is alive, and rotate before the cap."""
     while True:
         try:
             if not (TOPIC_A and TOPIC_B):
@@ -638,7 +681,7 @@ def discover(client):
 
 
 def get_endpoints():
-    st = current_status()
+    st = cached_status()
     link = st["link"]
     if not link:
         raise RuntimeError("No server is online. Start it first.")
@@ -674,16 +717,11 @@ def home():
 def status():
     if not TOPIC_A or not TOPIC_B or not TOPIC_GPU:
         return fail("One or more RVC_NTFY_TOPIC_* variables are missing.", 500)
-    return jsonify(ok=True, **current_status())
+    return jsonify(ok=True, **cached_status())
 
 
 @app.post("/api/start")
 def start():
-    """Start or ensure a CPU run.
-
-    If any CPU slot has a live link OR has been pushed recently (i.e. is
-    booting), this is a no-op. Otherwise the current primary slot gets a push.
-    The check is taken under SLOTS_LOCK so it can't race the rotator."""
     if not TOPIC_A or not TOPIC_B or not TOPIC_GPU:
         return fail("One or more RVC_NTFY_TOPIC_* variables are missing.", 500)
 
@@ -691,10 +729,9 @@ def start():
     cpu_b = SLOT_BY_ID["cpu_b"]
     state_a, state_b = _cpu_states()
 
-    # Already live or booting? Return without touching anything.
     if (state_a["link"] or state_b["link"]
             or cpu_a["pushed_at"] or cpu_b["pushed_at"]):
-        return jsonify(ok=True, already_running=True, **current_status())
+        return jsonify(ok=True, already_running=True, **cached_status())
 
     primary = _pick_cpu_primary(state_a, state_b)
     ok, info = push_slot(SLOT_BY_ID[primary["id"]], CPU_RUN_MINUTES, gpu=False)
@@ -719,6 +756,10 @@ def stop():
             slot["pushed_at"] = 0
             slot["stop_sent"] = True
     CLIENT_CACHE.update(url=None, client=None, endpoints=None)
+    # Invalidate the cache so the next status reflects the stop immediately.
+    with STATUS_CACHE_LOCK:
+        STATUS_CACHE["value"] = None
+        STATUS_CACHE["at"] = 0.0
     return jsonify(ok=True, message="Stop signal sent to all slots.")
 
 
@@ -733,7 +774,7 @@ def upgrade_gpu():
     if state_g["link"] or gpu["pushed_at"]:
         return jsonify(ok=True, already_running=True,
                        message="GPU is already running or booting.",
-                       **current_status())
+                       **cached_status())
 
     allowed, remaining = record_gpu_upgrade()
     if not allowed:
@@ -742,6 +783,11 @@ def upgrade_gpu():
     ok, info = push_slot(gpu, GPU_RUN_MINUTES, gpu=True)
     if not ok:
         return fail(info.get("error", "GPU push failed"), 500)
+
+    # Invalidate cache so the next status reflects the GPU boot.
+    with STATUS_CACHE_LOCK:
+        STATUS_CACHE["value"] = None
+        STATUS_CACHE["at"] = 0.0
 
     return jsonify(ok=True, already_running=False,
                    message="GPU push submitted. The 40-minute window starts now.",
