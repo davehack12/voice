@@ -4,37 +4,24 @@ app.py: the whole voice changer backend, meant to run on Render (or anywhere).
 Required environment variables (set these in Render's dashboard, never in code):
     KAGGLE_API_TOKEN      your Kaggle API token, from kaggle.com/settings/api
     NGROK_AUTHTOKEN       your ngrok authtoken, from dashboard.ngrok.com.
-                          Needed because Kaggle Secrets (UserSecretsClient) do not
-                          work in kernels pushed via the Kaggle API, so the token
-                          has to be baked into the kernel script by this backend.
     RVC_NTFY_TOPIC_A      CPU slot 1 ntfy topic (long random string).
     RVC_NTFY_TOPIC_B      CPU slot 2 ntfy topic (long random string).
     RVC_NTFY_TOPIC_GPU    GPU slot ntfy topic (long random string).
-                          These three topics are how the Kaggle runs and this
-                          backend talk. Anyone who knows a topic can read its
-                          link and stop that run, so keep them as secret as
-                          passwords.
 
 Optional environment variables (sensible defaults are used otherwise):
     KAGGLE_USERNAME       default: supporttopal
     KERNEL_SLUG           default: rvc-gpu-server
     CACHE_SLUG            default: rvc-cache
     DATASET               default: supporttopal/sweet-female-rvc
-    MODEL_NAME            default: sweet_female     (folder inside Applio/logs)
-    VOICE_MODEL           default: sweet_female.pth
-    VOICE_INDEX           default: sweet_female.index
-    ALLOWED_ORIGIN        default: *    (set to your site's URL once you have one)
-    CPU_RUN_MINUTES       default: 600  (10h; the CPU kernel's own time limit)
-    CPU_SWAP_AFTER_MIN    default: 570  (9h30m; when to push the spare CPU)
-    GPU_RUN_MINUTES       default: 40   (the GPU kernel's own time limit)
-    GPU_DAILY_RUNS        default: 6    (max GPU upgrades per rolling 24h)
-    START_ON_BOOT         default: 0    (set to 1 to auto-start a CPU run at boot)
-
-No accounts, database, or file storage are required. State is never kept only
-in this process's memory, since Render's free tier restarts it after idling.
-Each status check re-reads Kaggle and the ntfy topics directly, so state
-survives restarts except for the "which CPU topic is primary" choice, which
-is inferred from whichever topic has the most recent live run.
+    MODEL_NAME            default: sweet_female
+    VOICE_MODEL           default: logs/sweet_female/sweet_female.pth
+    VOICE_INDEX           default: logs/sweet_female/sweet_female.index
+    ALLOWED_ORIGIN        default: *
+    CPU_RUN_MINUTES       default: 600
+    CPU_SWAP_AFTER_MIN    default: 570
+    GPU_RUN_MINUTES       default: 40
+    GPU_DAILY_RUNS        default: 6
+    START_ON_BOOT         default: 0
 """
 import glob
 import json
@@ -65,17 +52,15 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "sweet_female")
 ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "*")
 NTFY = "https://ntfy.sh"
 
-VOICE_MODEL = os.environ.get("VOICE_MODEL", "sweet_female.pth")
-VOICE_INDEX = os.environ.get("VOICE_INDEX", "sweet_female.index")
+VOICE_MODEL = os.environ.get("VOICE_MODEL", "logs/sweet_female/sweet_female.pth")
+VOICE_INDEX = os.environ.get("VOICE_INDEX", "logs/sweet_female/sweet_female.index")
 
-# Three topics, kept separate so we can tell which LINK belongs to which run.
 TOPIC_A = os.environ.get("RVC_NTFY_TOPIC_A")
 TOPIC_B = os.environ.get("RVC_NTFY_TOPIC_B")
 TOPIC_GPU = os.environ.get("RVC_NTFY_TOPIC_GPU")
 
-# Timings and limits.
-CPU_RUN_MINUTES     = int(os.environ.get("CPU_RUN_MINUTES", "600"))     # 10h
-CPU_SWAP_AFTER_MIN  = int(os.environ.get("CPU_SWAP_AFTER_MIN", "570"))  # 9h30m
+CPU_RUN_MINUTES     = int(os.environ.get("CPU_RUN_MINUTES", "600"))
+CPU_SWAP_AFTER_MIN  = int(os.environ.get("CPU_SWAP_AFTER_MIN", "570"))
 GPU_RUN_MINUTES     = int(os.environ.get("GPU_RUN_MINUTES", "40"))
 GPU_DAILY_RUNS      = int(os.environ.get("GPU_DAILY_RUNS", "6"))
 START_ON_BOOT       = os.environ.get("START_ON_BOOT", "0") == "1"
@@ -97,38 +82,25 @@ CLIENT_CACHE = {"url": None, "client": None, "endpoints": None}
 
 # ---------- runtime state ----------
 #
-# SLOTS describes every topic we manage. The CPU rotator alternates between
-# cpu_a and cpu_b. The GPU is separate.
-#
-# For each slot we track:
-#   topic           the ntfy topic string
-#   kind            "cpu" or "gpu"
-#   pushed_at       unix time when we last pushed a kernel to this slot (0 = never)
-#   push_lock       ensures we never double-push
-#   last_link_seen  the last LINK value we observed on this topic
-#
-# `link` is not stored here; it is recomputed on every status call by reading
-# the topic's ntfy history. That way a backend restart does not lose the fact
-# that a run is alive.
+# Every write to a slot's pushed_at or a "we already handled this" flag goes
+# through SLOTS_LOCK. Without it, the rotator and the /api/start handler race
+# each other and can both decide to push.
+
+SLOTS_LOCK = threading.Lock()
 
 SLOTS = [
-    {"id": "cpu_a", "kind": "cpu", "topic": TOPIC_A, "pushed_at": 0, "push_lock": threading.Lock()},
-    {"id": "cpu_b", "kind": "cpu", "topic": TOPIC_B, "pushed_at": 0, "push_lock": threading.Lock()},
-    {"id": "gpu",   "kind": "gpu", "topic": TOPIC_GPU, "pushed_at": 0, "push_lock": threading.Lock()},
+    {"id": "cpu_a", "kind": "cpu", "topic": TOPIC_A, "pushed_at": 0,
+     "push_lock": threading.Lock(), "stop_sent": False},
+    {"id": "cpu_b", "kind": "cpu", "topic": TOPIC_B, "pushed_at": 0,
+     "push_lock": threading.Lock(), "stop_sent": False},
+    {"id": "gpu",   "kind": "gpu", "topic": TOPIC_GPU, "pushed_at": 0,
+     "push_lock": threading.Lock(), "stop_sent": False},
 ]
 SLOT_BY_ID = {s["id"]: s for s in SLOTS}
 
-# Rolling 24h log of GPU upgrade timestamps, so we can enforce the daily cap.
 UPGRADE_LOG = []
 UPGRADE_LOG_LOCK = threading.Lock()
 
-# Tracks which CPU slot is currently primary. Recomputed on every status call
-# based on which CPU slot has the most recent live run.
-CPU_PRIMARY_ID = None
-
-# The run script itself. Listens for STOP on its own topic from the moment it
-# starts, sends a heartbeat every minute, and shuts itself and every child
-# process down on STOP or once the time limit is reached.
 KERNEL_TEMPLATE = r"""
 import glob, json, os, re, shutil, subprocess, sys, threading, time, urllib.request
 
@@ -158,9 +130,6 @@ def sh(cmd, cwd=None):
 
 
 def stop_requested():
-    # Only look at messages posted after THIS run started. ntfy keeps a topic's
-    # message history for hours, so "since=all" would also return any old STOP
-    # left over from a previous run and cause an instant, silent shutdown.
     try:
         url = f"{NTFY}/{TOPIC}/json?poll=1&since={int(started)}"
         with urllib.request.urlopen(url, timeout=20) as r:
@@ -222,8 +191,6 @@ if USE_CACHE:
 try:
     say("STATUS using cached libraries" if libs else "STATUS no cache found, doing full install")
     sh(f"git clone --depth 1 https://github.com/IAHispano/Applio.git {APPLIO}")
-    # PyTorch 2.6+ defaults torch.load to weights_only=True, which refuses to
-    # unpickle RVC model files. Patch it to False for our inference path.
     sh("sed -i 's/weights_only=True/weights_only=False/g' /kaggle/working/Applio/rvc/infer/infer.py")
     sh("apt-get update -y")
     sh("apt-get install -y portaudio19-dev libportaudio2")
@@ -291,8 +258,8 @@ def fail(message, code=400):
 
 # ---------- ntfy + kaggle helpers ----------
 
-def ntfy_read(topic, since_all=True):
-    url = f"{NTFY}/{topic}/json?poll=1&since=all" if since_all else f"{NTFY}/{topic}/json?poll=1"
+def ntfy_read(topic):
+    url = f"{NTFY}/{topic}/json?poll=1&since=all"
     try:
         with urllib.request.urlopen(url, timeout=20) as r:
             text = r.read().decode("utf-8", "replace")
@@ -315,11 +282,6 @@ def ntfy_send(topic, text):
 
 
 def find_link(msgs):
-    """Return the live link for a topic, or None if the run has finished.
-
-    A LINK followed by a STATUS finished means that run is over; we forget the
-    link at that point so a stale tunnel is never reused.
-    """
     link = None
     for m in msgs:
         msg = m.get("message", "")
@@ -391,8 +353,10 @@ def build_kernel_code(topic, minutes):
 
 
 def push_slot(slot, minutes, gpu):
-    """Push a kernel to a slot. Returns (ok, info) where info is a dict with
-    either an error message or the kaggle output. Never raises."""
+    """Push a kernel to a slot. Returns (ok, info). Never raises.
+
+    Acquires SLOTS_LOCK so a concurrent /api/start and rotator tick can't both
+    decide to push the same slot."""
     if not NGROK_TOKEN:
         return False, {"error": "NGROK_AUTHTOKEN is not set on the server."}
     if not slot["topic"]:
@@ -400,19 +364,23 @@ def push_slot(slot, minutes, gpu):
     if not shutil.which("kaggle"):
         return False, {"error": "The kaggle command is not available on this server."}
 
-    with slot["push_lock"]:
-        code = build_kernel_code(slot["topic"], minutes)
-        write_kernel(code, gpu=gpu)
-        rc, out = kaggle_cli("kernels", "push", "-p", str(BUILD),
-                             "-t", str(minutes * 60 + 300))
-        if rc != 0:
-            return False, {"error": f"Kaggle push failed: {out}"}
-        slot["pushed_at"] = int(time.time())
-        return True, {"kaggle_output": out}
+    with SLOTS_LOCK:
+        with slot["push_lock"]:
+            # Double-check: if something else pushed a moment ago, skip.
+            if slot["pushed_at"]:
+                return False, {"error": "This slot was already pushed recently."}
+            code = build_kernel_code(slot["topic"], minutes)
+            write_kernel(code, gpu=gpu)
+            rc, out = kaggle_cli("kernels", "push", "-p", str(BUILD),
+                                 "-t", str(minutes * 60 + 300))
+            if rc != 0:
+                return False, {"error": f"Kaggle push failed: {out}"}
+            slot["pushed_at"] = int(time.time())
+            slot["stop_sent"] = False
+            return True, {"kaggle_output": out}
 
 
 def slot_link(slot):
-    """Read the slot's topic and return its current live link, or None."""
     if not slot["topic"]:
         return None
     msgs = ntfy_read(slot["topic"])
@@ -442,7 +410,6 @@ def slot_state_dict(slot):
 
 
 def record_gpu_upgrade():
-    """Returns (allowed, remaining_today). Records the timestamp if allowed."""
     now = time.time()
     with UPGRADE_LOG_LOCK:
         cutoff = now - 24 * 3600
@@ -463,6 +430,18 @@ def upgrades_remaining():
 
 # ---------- current status ----------
 
+def _pick_cpu_primary(state_a, state_b):
+    """Return the state dict of the CPU slot that should be considered primary.
+
+    Rule: among slots with a live link, the most recently pushed wins. If none
+    have a link, the most recently pushed slot wins (even if its run has died,
+    we don't want to instantly promote an idle slot).
+    """
+    live = [s for s in (state_a, state_b) if s["link"]]
+    pool = live or [state_a, state_b]
+    return max(pool, key=lambda s: s["pushed_at"] or 0)
+
+
 def current_status():
     cpu_a = SLOT_BY_ID["cpu_a"]
     cpu_b = SLOT_BY_ID["cpu_b"]
@@ -470,19 +449,10 @@ def current_status():
 
     state_a = slot_state_dict(cpu_a)
     state_b = slot_state_dict(cpu_b)
-    state_g   = slot_state_dict(gpu)
+    state_g = slot_state_dict(gpu)
 
-    # CPU primary: the CPU slot whose run was pushed most recently AND has a
-    # live link. If both have links (brief overlap during a swap), the one
-    # pushed most recently wins. If neither has a link, fall back to whichever
-    # has the most recent push.
-    cpu_candidates = [s for s in (state_a, state_b) if s["link"]]
-    if cpu_candidates:
-        cpu_primary = max(cpu_candidates, key=lambda s: s["pushed_at"] or 0)
-    else:
-        cpu_primary = max((state_a, state_b), key=lambda s: s["pushed_at"] or 0)
+    cpu_primary = _pick_cpu_primary(state_a, state_b)
 
-    # GPU wins as the reported link whenever it has a live link.
     gpu_live = bool(state_g["link"])
     if gpu_live:
         primary = "gpu"
@@ -493,7 +463,6 @@ def current_status():
 
     kaggle = run_state()
 
-    # The CPU spare is a booting run on the non-primary CPU slot.
     cpu_spare = state_b if cpu_primary["id"] == "cpu_a" else state_a
     if cpu_spare["link"]:
         cpu_spare_state = "ready"
@@ -509,11 +478,7 @@ def current_status():
     else:
         gpu_state = "idle"
 
-    # last_message reported to the frontend is whichever run is primary.
-    if primary == "gpu":
-        last_msg = state_g["last_message"]
-    else:
-        last_msg = cpu_primary["last_message"]
+    last_msg = state_g["last_message"] if primary == "gpu" else cpu_primary["last_message"]
 
     return {
         "kaggle_state": kaggle,
@@ -534,72 +499,76 @@ def current_status():
 
 # ---------- background threads ----------
 
+def _cpu_states():
+    return (slot_state_dict(SLOT_BY_ID["cpu_a"]),
+            slot_state_dict(SLOT_BY_ID["cpu_b"]))
+
+
 def cpu_rotator():
-    """Every 60s: make sure a CPU run is alive, and rotate before the cap."""
+    """Every 60s: make sure one CPU run is alive, and rotate before the cap.
+
+    The three branches are mutually exclusive on any given tick:
+      A. neither slot has a live link and neither has a pending push  -> push one
+      B. primary is past CPU_SWAP_AFTER_MIN and spare has no push yet -> push spare
+      C. spare has a live link and we haven't stopped the old primary  -> stop old
+    Once a slot is stopped, stop_sent=True keeps us from stopping it again.
+    """
     while True:
         try:
-            if TOPIC_A and TOPIC_B:
-                cpu_a = SLOT_BY_ID["cpu_a"]
-                cpu_b = SLOT_BY_ID["cpu_b"]
-                state_a = slot_state_dict(cpu_a)
-                state_b = slot_state_dict(cpu_b)
+            if not (TOPIC_A and TOPIC_B):
+                time.sleep(60)
+                continue
 
-                cpu_candidates = [s for s in (state_a, state_b) if s["link"]]
-                if cpu_candidates:
-                    cpu_primary = max(cpu_candidates, key=lambda s: s["pushed_at"] or 0)
-                else:
-                    cpu_primary = max((state_a, state_b), key=lambda s: s["pushed_at"] or 0)
+            cpu_a = SLOT_BY_ID["cpu_a"]
+            cpu_b = SLOT_BY_ID["cpu_b"]
+            state_a, state_b = _cpu_states()
+            cpu_primary = _pick_cpu_primary(state_a, state_b)
 
-                spare_id = "cpu_b" if cpu_primary["id"] == "cpu_a" else "cpu_a"
-                spare = SLOT_BY_ID[spare_id]
-                spare_state = slot_state_dict(spare)
+            spare_id = "cpu_b" if cpu_primary["id"] == "cpu_a" else "cpu_a"
+            spare = SLOT_BY_ID[spare_id]
+            spare_state = state_b if spare_id == "cpu_b" else state_a
 
-                primary_age_min = (
-                    int((cpu_primary["age_seconds"] or 0) / 60)
-                    if cpu_primary["age_seconds"] else 0
-                )
+            primary_age_min = (
+                int((cpu_primary["age_seconds"] or 0) / 60)
+                if cpu_primary["age_seconds"] else 0
+            )
 
-                # If no CPU run at all, push one to the primary slot.
-                if not cpu_primary["link"] and not spare_state["pushed_at"]:
-                    push_slot(cpu_primary_slot(), CPU_RUN_MINUTES, gpu=False)
+            # Branch A: nothing running at all, and nothing booting.
+            if (not cpu_primary["link"]
+                    and not cpu_primary["pushed_at"]
+                    and not spare_state["pushed_at"]
+                    and not spare_state["link"]):
+                push_slot(SLOT_BY_ID[cpu_primary["id"]], CPU_RUN_MINUTES, gpu=False)
+                time.sleep(60)
+                continue
 
-                # If primary is past the swap threshold and the spare hasn't
-                # been pushed, push the spare.
-                elif (primary_age_min >= CPU_SWAP_AFTER_MIN
-                      and not spare_state["pushed_at"]
-                      and not spare_state["link"]):
-                    push_slot(spare, CPU_RUN_MINUTES, gpu=False)
+            # Branch C: spare is live -> promote, stop the old primary once.
+            if spare_state["link"]:
+                primary_slot = SLOT_BY_ID[cpu_primary["id"]]
+                with SLOTS_LOCK:
+                    if not primary_slot["stop_sent"]:
+                        primary_slot["stop_sent"] = True
+                        try:
+                            ntfy_send(primary_slot["topic"], "STOP")
+                        except Exception:
+                            pass
+                time.sleep(60)
+                continue
 
-                # If spare is live, promote and kill the old primary.
-                elif spare_state["link"]:
-                    # STOP the old primary
-                    try:
-                        ntfy_send(cpu_primary["topic"], "STOP")
-                    except Exception:
-                        pass
-                    # The new primary is the spare. current_status() will pick
-                    # it up automatically because its pushed_at is newer.
+            # Branch B: primary is aging out and spare hasn't been pushed yet.
+            if (primary_age_min >= CPU_SWAP_AFTER_MIN
+                    and not spare_state["pushed_at"]):
+                push_slot(spare, CPU_RUN_MINUTES, gpu=False)
+                time.sleep(60)
+                continue
+
         except Exception:
             pass
         time.sleep(60)
 
 
-def cpu_primary_slot():
-    """Return the CPU slot that should be considered primary right now."""
-    cpu_a = SLOT_BY_ID["cpu_a"]
-    cpu_b = SLOT_BY_ID["cpu_b"]
-    state_a = slot_state_dict(cpu_a)
-    state_b = slot_state_dict(cpu_b)
-    cpu_candidates = [s for s in (state_a, state_b) if s["link"]]
-    if cpu_candidates:
-        winner = max(cpu_candidates, key=lambda s: s["pushed_at"] or 0)
-    else:
-        winner = max((state_a, state_b), key=lambda s: s["pushed_at"] or 0)
-    return SLOT_BY_ID[winner["id"]]
-
-
 def gpu_watchdog():
-    """Every 60s: kill the GPU run once it has lived GPU_RUN_MINUTES."""
+    """Every 60s: STOP the GPU run once it has lived GPU_RUN_MINUTES."""
     while True:
         try:
             gpu = SLOT_BY_ID["gpu"]
@@ -607,18 +576,20 @@ def gpu_watchdog():
             if pushed and TOPIC_GPU:
                 elapsed_min = int((time.time() - pushed) / 60)
                 if elapsed_min >= GPU_RUN_MINUTES:
-                    # send STOP; the kernel watchdog handles the actual shutdown.
-                    try:
-                        ntfy_send(gpu["topic"], "STOP")
-                    except Exception:
-                        pass
-                    gpu["pushed_at"] = 0
+                    with SLOTS_LOCK:
+                        if not gpu["stop_sent"]:
+                            gpu["stop_sent"] = True
+                            try:
+                                ntfy_send(gpu["topic"], "STOP")
+                            except Exception:
+                                pass
+                        gpu["pushed_at"] = 0
         except Exception:
             pass
         time.sleep(60)
 
 
-# ---------- Applio proxy (inference + text to speech) ----------
+# ---------- Applio proxy ----------
 
 N_INFER_PARAMS = 60
 N_TTS_PARAMS = 25
@@ -708,21 +679,25 @@ def status():
 
 @app.post("/api/start")
 def start():
-    """Start or ensure a CPU run. If one is already live or booting, this is
-    a no-op. Idempotent so the frontend can call it freely."""
+    """Start or ensure a CPU run.
+
+    If any CPU slot has a live link OR has been pushed recently (i.e. is
+    booting), this is a no-op. Otherwise the current primary slot gets a push.
+    The check is taken under SLOTS_LOCK so it can't race the rotator."""
     if not TOPIC_A or not TOPIC_B or not TOPIC_GPU:
         return fail("One or more RVC_NTFY_TOPIC_* variables are missing.", 500)
 
     cpu_a = SLOT_BY_ID["cpu_a"]
     cpu_b = SLOT_BY_ID["cpu_b"]
-    state_a = slot_state_dict(cpu_a)
-    state_b = slot_state_dict(cpu_b)
+    state_a, state_b = _cpu_states()
 
-    if state_a["link"] or state_b["link"] or state_a["pushed_at"] or state_b["pushed_at"]:
-        # A CPU run is already live or booting.
+    # Already live or booting? Return without touching anything.
+    if (state_a["link"] or state_b["link"]
+            or cpu_a["pushed_at"] or cpu_b["pushed_at"]):
         return jsonify(ok=True, already_running=True, **current_status())
 
-    ok, info = push_slot(cpu_primary_slot(), CPU_RUN_MINUTES, gpu=False)
+    primary = _pick_cpu_primary(state_a, state_b)
+    ok, info = push_slot(SLOT_BY_ID[primary["id"]], CPU_RUN_MINUTES, gpu=False)
     if not ok:
         return fail(info.get("error", "Push failed"), 500)
     return jsonify(ok=True, already_running=False,
@@ -732,31 +707,29 @@ def start():
 
 @app.post("/api/stop")
 def stop():
-    """Stop everything: CPU and GPU. Used for a hard shutdown."""
     if not TOPIC_A or not TOPIC_B or not TOPIC_GPU:
         return fail("One or more RVC_NTFY_TOPIC_* variables are missing.", 500)
 
-    for slot in SLOTS:
-        try:
-            ntfy_send(slot["topic"], "STOP")
+    with SLOTS_LOCK:
+        for slot in SLOTS:
+            try:
+                ntfy_send(slot["topic"], "STOP")
+            except Exception:
+                pass
             slot["pushed_at"] = 0
-        except Exception:
-            pass
+            slot["stop_sent"] = True
     CLIENT_CACHE.update(url=None, client=None, endpoints=None)
     return jsonify(ok=True, message="Stop signal sent to all slots.")
 
 
 @app.post("/api/upgrade-gpu")
 def upgrade_gpu():
-    """Push a GPU run. The 40-minute cap starts immediately at push time. All
-    users then share the GPU link while it is live."""
     if not TOPIC_GPU:
         return fail("RVC_NTFY_TOPIC_GPU is not set on the server.", 500)
 
     gpu = SLOT_BY_ID["gpu"]
     state_g = slot_state_dict(gpu)
 
-    # Already live or booting? No-op.
     if state_g["link"] or gpu["pushed_at"]:
         return jsonify(ok=True, already_running=True,
                        message="GPU is already running or booting.",
@@ -915,10 +888,10 @@ def _boot():
     if START_ON_BOOT:
         try:
             time.sleep(5)
-            cpu_primary = cpu_primary_slot()
-            state = slot_state_dict(cpu_primary)
-            if not state["link"] and not state["pushed_at"]:
-                push_slot(cpu_primary, CPU_RUN_MINUTES, gpu=False)
+            state_a, state_b = _cpu_states()
+            primary = _pick_cpu_primary(state_a, state_b)
+            if not primary["link"] and not primary["pushed_at"]:
+                push_slot(SLOT_BY_ID[primary["id"]], CPU_RUN_MINUTES, gpu=False)
         except Exception:
             pass
 
