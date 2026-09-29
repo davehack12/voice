@@ -317,8 +317,14 @@ def last_message(msgs):
 
 
 def kaggle_cli(*args):
+    """Run a kaggle CLI command with a hard timeout so a hanging prompt
+    can't freeze a background thread forever. Returns (rc, output)."""
     env = dict(os.environ)
-    p = subprocess.run(["kaggle", *args], capture_output=True, text=True, env=env)
+    try:
+        p = subprocess.run(["kaggle", *args], capture_output=True, text=True,
+                           env=env, timeout=60)
+    except subprocess.TimeoutExpired:
+        return 1, f"kaggle {' '.join(args)} timed out after 60s"
     return p.returncode, (p.stdout + p.stderr).strip()
 
 
@@ -409,14 +415,6 @@ def push_slot(slot, minutes, gpu, preferred_token=None):
             token = claim_token(slot, preferred=preferred_token)
             if not token:
                 return False, {"error": "No ngrok token free. Both slots are holding one."}
-
-            # If the kernel is stuck in a terminal error state, Kaggle refuses
-            # a new push. Delete clears it. `-y` suppresses the prompt.
-            state = run_state()
-            if state in ("ERROR", "CANCELLED", "CANCELED"):
-                print(f"[push] kernel in {state}, deleting before push", flush=True)
-                kaggle_cli("kernels", "delete", "-y", KERNEL_ID)
-                time.sleep(3)
 
             code = build_kernel_code(slot["topic"], minutes, token)
             write_kernel(code, gpu=gpu)
@@ -721,8 +719,8 @@ def gpu_watchdog():
 def link_watcher():
     """Safety net. If no link and nothing booting, push a CPU on token 1.
 
-    Logs the reason for every failure so we can see what Kaggle is refusing.
-    Backs off exponentially on consecutive failures so we don't hammer the API.
+    Logs the reason for every failure. Backs off exponentially on consecutive
+    failures so a broken Kaggle state doesn't flood the log.
     """
     while True:
         try:
