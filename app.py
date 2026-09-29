@@ -35,7 +35,6 @@ import os
 import re
 import secrets
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -86,9 +85,13 @@ DONE = {"COMPLETE", "ERROR", "CANCELACKNOWLEDGED"}
 WORK = Path(tempfile.mkdtemp(prefix="rvc_backend_"))
 BUILD = WORK / "kernel_build"
 
-if not KAGGLE_USERNAME or not KAGGLE_KEY:
-    print("[config] FATAL: KAGGLE_USERNAME and KAGGLE_KEY must both be set.",
-          flush=True)
+print(f"[config] KAGGLE_USERNAME={KAGGLE_USERNAME!r} KERNEL_SLUG={KERNEL_SLUG!r} "
+      f"KERNEL_ID={KERNEL_ID!r} KEY_SET={bool(KAGGLE_KEY)} "
+      f"NGROK1_SET={bool(NGROK_TOKEN_1)} NGROK2_SET={bool(NGROK_TOKEN_2)}",
+      flush=True)
+
+if not KAGGLE_KEY:
+    print("[config] FATAL: KAGGLE_KEY is not set.", flush=True)
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGIN}})
@@ -323,32 +326,30 @@ def last_message(msgs):
     return msgs[-1] if msgs else None
 
 
-def kaggle_cli(*args, timeout=60):
+def kaggle_cli(*args, timeout=120):
+    """Run a kaggle CLI command with a hard timeout that kills the whole
+    process group. subprocess.run with start_new_session=True and a single
+    merged pipe is what makes the timeout actually fire; Popen.communicate
+    can hang forever if a grandchild holds the stdout pipe.
+    """
     env = dict(os.environ)
-    proc = subprocess.Popen(
-        ["kaggle", *args],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-        start_new_session=True,
-    )
     try:
-        out, err = proc.communicate(timeout=timeout)
-        return proc.returncode, ((out or "") + (err or "")).strip()
+        p = subprocess.run(
+            ["kaggle", *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            timeout=timeout,
+            start_new_session=True,
+        )
+        return p.returncode, (p.stdout or "").strip()
     except subprocess.TimeoutExpired:
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except Exception:
-            try:
-                proc.kill()
-            except Exception:
-                pass
-        try:
-            out, err = proc.communicate(timeout=5)
-        except Exception:
-            out, err = "", ""
         return 1, f"kaggle {' '.join(args)} timed out after {timeout}s"
+    except FileNotFoundError as e:
+        return 1, f"kaggle CLI not found: {e}"
+    except Exception as e:
+        return 1, f"{type(e).__name__}: {e}"
 
 
 def parse_state(out):
@@ -390,29 +391,6 @@ def write_kernel(code, gpu):
     (BUILD / "kernel-metadata.json").write_text(json.dumps(meta, indent=2))
 
 
-# ---------- Kaggle SDK push (in-process, no subprocess) ----------
-
-def push_kernel_via_sdk():
-    """Push the kernel using Kaggle's Python SDK directly.
-
-    The CLI version of this forks subprocesses that can hang on network
-    calls in ways SIGKILL can't reclaim. The SDK runs in-process, so any
-    hang is on the HTTP client's own timeout, which returns.
-    """
-    try:
-        from kaggle import KaggleApi
-    except Exception as e:
-        return False, f"kaggle SDK import failed: {e}"
-
-    try:
-        api = KaggleApi()
-        api.authenticate()
-        api.kernels_push(str(BUILD))
-        return True, "ok"
-    except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
-
-
 # ---------- token management ----------
 
 TOKEN_1 = "1"
@@ -446,35 +424,47 @@ def build_kernel_code(topic, minutes, token_name):
 
 
 def push_slot(slot, minutes, gpu, preferred_token=None):
+    print(f"[push] entering push_slot for {slot['id']}", flush=True)
+
     if not NGROK_TOKEN_1 or not NGROK_TOKEN_2:
+        print("[push] rejected: missing ngrok tokens", flush=True)
         return False, {"error": "Both NGROK_AUTHTOKEN_1 and NGROK_AUTHTOKEN_2 must be set."}
     if not KAGGLE_KEY:
+        print("[push] rejected: missing KAGGLE_KEY", flush=True)
         return False, {"error": "KAGGLE_KEY is not set on the server."}
     if not slot["topic"]:
+        print(f"[push] rejected: missing topic for {slot['id']}", flush=True)
         return False, {"error": f"Topic for slot {slot['id']} is not set."}
 
     with SLOTS_LOCK:
         with slot["push_lock"]:
             if slot["pushed_at"]:
+                print(f"[push] rejected: {slot['id']} already pushed", flush=True)
                 return False, {"error": "This slot was already pushed recently."}
 
             token = claim_token(slot, preferred=preferred_token)
             if not token:
+                print("[push] rejected: no ngrok token free", flush=True)
                 return False, {"error": "No ngrok token free. Both slots are holding one."}
 
             code = build_kernel_code(slot["topic"], minutes, token)
             write_kernel(code, gpu=gpu)
 
             print(f"[push] submitting {slot['id']} on token {token}", flush=True)
-            ok, out = push_kernel_via_sdk()
-            if not ok:
+            rc, out = kaggle_cli(
+                "kernels", "push", "-p", str(BUILD),
+                "-t", str(minutes * 60 + 300),
+                timeout=120,
+            )
+            if rc != 0:
                 slot["token"] = None
                 print(f"[push] failed for {slot['id']}: {out}", flush=True)
                 return False, {"error": f"Kaggle push failed: {out}"}
+
             slot["pushed_at"] = int(time.time())
             slot["stop_sent"] = False
             slot["hard_killed_at"] = 0
-            print(f"[push] ok for {slot['id']} on token {token}", flush=True)
+            print(f"[push] ok for {slot['id']} on token {token}: {out[:200]}", flush=True)
             return True, {"kaggle_output": out, "token": token}
 
 
