@@ -102,7 +102,10 @@ CLIENT_CACHE = {"url": None, "client": None, "endpoints": None}
 
 # ---------- runtime state ----------
 
-SLOTS_LOCK = threading.Lock()
+# RLock, not Lock. push_slot takes this lock and then calls claim_token,
+# which also takes it. A plain Lock deadlocks on the second acquire from the
+# same thread. RLock allows the nested acquire.
+SLOTS_LOCK = threading.RLock()
 
 SLOTS = [
     {"id": "cpu_a", "kind": "cpu", "topic": TOPIC_A, "pushed_at": 0,
@@ -327,11 +330,6 @@ def last_message(msgs):
 
 
 def kaggle_cli(*args, timeout=120):
-    """Run a kaggle CLI command with a hard timeout that kills the whole
-    process group. subprocess.run with start_new_session=True and a single
-    merged pipe is what makes the timeout actually fire; Popen.communicate
-    can hang forever if a grandchild holds the stdout pipe.
-    """
     env = dict(os.environ)
     try:
         p = subprocess.run(
