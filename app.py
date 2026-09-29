@@ -870,4 +870,211 @@ def start():
                    kaggle_output=info.get("kaggle_output"))
 
 
-@app.post
+@app.post("/api/stop")
+def stop():
+    if not TOPIC_A or not TOPIC_B or not TOPIC_GPU:
+        return fail("One or more RVC_NTFY_TOPIC_* variables are missing.", 500)
+
+    for slot in SLOTS:
+        hard_kill_slot(slot)
+    CLIENT_CACHE.update(url=None, client=None, endpoints=None)
+    with STATUS_CACHE_LOCK:
+        STATUS_CACHE["value"] = None
+        STATUS_CACHE["at"] = 0.0
+    return jsonify(ok=True, message="Stop sent to all slots.")
+
+
+@app.post("/api/upgrade-gpu")
+def upgrade_gpu():
+    if not TOPIC_GPU:
+        return fail("RVC_NTFY_TOPIC_GPU is not set on the server.", 500)
+
+    gpu = SLOT_BY_ID["gpu"]
+    state_g = slot_state_dict(gpu)
+
+    if state_g["link"] or gpu["pushed_at"]:
+        return jsonify(ok=True, already_running=True,
+                       message="GPU is already running or booting.",
+                       **cached_status())
+
+    allowed, remaining = record_gpu_upgrade()
+    if not allowed:
+        return fail(f"Daily GPU limit reached. Try again later. Remaining: {remaining}.", 429)
+
+    cpu_primary = _pick_cpu_primary(*_cpu_states())
+    primary_token = cpu_primary.get("token")
+    preferred = TOKEN_2 if primary_token == TOKEN_1 else TOKEN_1
+
+    ok, info = push_slot(gpu, GPU_RUN_MINUTES, gpu=True, preferred_token=preferred)
+    if not ok:
+        return fail(info.get("error", "GPU push failed"), 500)
+
+    GPU_HOLD_UNTIL["at"] = 0
+
+    with STATUS_CACHE_LOCK:
+        STATUS_CACHE["value"] = None
+        STATUS_CACHE["at"] = 0.0
+
+    return jsonify(ok=True, already_running=False,
+                   message="GPU push submitted. The 40-minute window starts now.",
+                   gpu_upgrades_remaining=remaining,
+                   kaggle_output=info.get("kaggle_output"))
+
+
+@app.get("/api/voices")
+def voices():
+    try:
+        def go(client, found, meta):
+            infer_meta = meta[found["infer"]]
+            tts_meta = meta[found["tts"]] if found["tts"] else None
+            out = {
+                "f0_methods": infer_meta["choices"][I_INFER["f0"]] or ["rmvpe"],
+                "export_formats": infer_meta["choices"][I_INFER["fmt"]] or ["WAV"],
+                "model": VOICE_MODEL,
+                "index": VOICE_INDEX,
+            }
+            if tts_meta:
+                out["tts_voices"] = tts_meta["choices"][I_TTS["voice"]] or []
+                out["tts_available"] = True
+            else:
+                out["tts_voices"] = []
+                out["tts_available"] = False
+            return out
+        return jsonify(ok=True, **with_reconnect(go))
+    except Exception as e:
+        return fail(e, 502)
+
+
+@app.post("/api/convert")
+def convert():
+    f = request.files.get("audio")
+    if not f:
+        return fail("Attach an audio file as 'audio'.")
+    try:
+        cfg = json.loads(request.form.get("settings", "{}"))
+    except ValueError:
+        return fail("Bad settings JSON.")
+
+    ext = Path(f.filename or "").suffix.lower()
+    ext = ext if re.fullmatch(r"\.[a-z0-9]{2,5}", ext) else ".wav"
+    src = WORK / f"in_{secrets.token_hex(4)}{ext}"
+    f.save(src)
+
+    def go(client, found, meta):
+        args = list(meta[found["infer"]]["defaults"])
+        with CONVERT_LOCK:
+            up = client.predict(handle_file(str(src)), api_name=found["save"])
+            args[I_INFER["terms"]] = True
+            args[I_INFER["audio"]] = as_value(up[0])
+            args[I_INFER["output"]] = as_value(up[1])
+            args[I_INFER["pitch"]] = int(cfg.get("pitch", 10))
+            args[I_INFER["index_rate"]] = float(cfg.get("index_rate", 0.3))
+            if "volume" in cfg:
+                args[I_INFER["volume"]] = float(cfg["volume"])
+            if "protect" in cfg:
+                args[I_INFER["protect"]] = float(cfg["protect"])
+            if cfg.get("f0"):
+                args[I_INFER["f0"]] = cfg["f0"]
+            if cfg.get("fmt"):
+                args[I_INFER["fmt"]] = cfg["fmt"]
+            for key in ("split", "autotune", "clean"):
+                if key in cfg:
+                    args[I_INFER[key]] = bool(cfg[key])
+            if "clean_strength" in cfg:
+                args[I_INFER["clean_strength"]] = float(cfg["clean_strength"])
+            args[I_INFER["model"]] = VOICE_MODEL
+            args[I_INFER["index"]] = VOICE_INDEX
+            return client.predict(*args, api_name=found["infer"])
+
+    try:
+        res = with_reconnect(go)
+    except Exception as e:
+        return fail(f"Conversion failed: {e}", 502)
+    finally:
+        src.unlink(missing_ok=True)
+    return _store_result(res)
+
+
+@app.post("/api/tts")
+def tts():
+    body = request.get_json(silent=True) or {}
+    text = (body.get("text") or "").strip()
+    if not text:
+        return fail("Send some 'text' to speak.")
+    cfg = body.get("settings", {})
+
+    def go(client, found, meta):
+        if not found["tts"]:
+            raise RuntimeError("This Applio session has no text to speech tab.")
+        args = list(meta[found["tts"]]["defaults"])
+        with CONVERT_LOCK:
+            args[I_TTS["terms"]] = True
+            args[I_TTS["text"]] = text
+            if cfg.get("voice"):
+                args[I_TTS["voice"]] = cfg["voice"]
+            if "rate" in cfg:
+                args[I_TTS["rate"]] = int(cfg["rate"])
+            args[I_TTS["pitch"]] = int(cfg.get("pitch", 10))
+            args[I_TTS["index_rate"]] = float(cfg.get("index_rate", 0.3))
+            if "protect" in cfg:
+                args[I_TTS["protect"]] = float(cfg["protect"])
+            if cfg.get("f0"):
+                args[I_TTS["f0"]] = cfg["f0"]
+            if cfg.get("fmt"):
+                args[I_TTS["fmt"]] = cfg["fmt"]
+            args[I_TTS["model"]] = VOICE_MODEL
+            args[I_TTS["index"]] = VOICE_INDEX
+            return client.predict(*args, api_name=found["tts"])
+
+    try:
+        res = with_reconnect(go)
+    except Exception as e:
+        return fail(f"Text to speech failed: {e}", 502)
+    return _store_result(res)
+
+
+def _store_result(res):
+    message, out = res[0], as_value(res[1])
+    if not out or not os.path.exists(str(out)):
+        return fail(message or "Applio returned no audio.", 502)
+    rid = secrets.token_hex(6)
+    dest = WORK / f"out_{rid}{Path(str(out)).suffix or '.wav'}"
+    shutil.copy(str(out), dest)
+    RESULTS[rid] = dest
+    return jsonify(ok=True, id=rid, message=message)
+
+
+@app.get("/api/result/<rid>")
+def result(rid):
+    p = RESULTS.get(rid)
+    if not p or not p.exists():
+        return fail("Result not found (the server may have restarted since it was made).", 404)
+    mime = mimetypes.guess_type(str(p))[0] or "audio/wav"
+    return send_file(p, mimetype=mime, as_attachment=bool(request.args.get("dl")),
+                     download_name=f"converted_{rid}{p.suffix}")
+
+
+# ---------- boot ----------
+
+def _boot():
+    if START_ON_BOOT:
+        try:
+            time.sleep(5)
+            state_a, state_b = _cpu_states()
+            primary = _pick_cpu_primary(state_a, state_b)
+            if not primary["link"] and not primary["pushed_at"]:
+                push_slot(SLOT_BY_ID[primary["id"]], CPU_RUN_MINUTES,
+                          gpu=False, preferred_token=TOKEN_1)
+        except Exception:
+            pass
+
+
+threading.Thread(target=cpu_rotator, daemon=True).start()
+threading.Thread(target=gpu_watchdog, daemon=True).start()
+threading.Thread(target=link_watcher, daemon=True).start()
+threading.Thread(target=_boot, daemon=True).start()
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port)
