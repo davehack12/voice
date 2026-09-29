@@ -86,11 +86,9 @@ DONE = {"COMPLETE", "ERROR", "CANCELACKNOWLEDGED"}
 WORK = Path(tempfile.mkdtemp(prefix="rvc_backend_"))
 BUILD = WORK / "kernel_build"
 
-# Startup sanity check. The CLI needs username + key; without them it hangs
-# on an interactive prompt and the whole push path stalls silently.
 if not KAGGLE_USERNAME or not KAGGLE_KEY:
-    print("[config] FATAL: KAGGLE_USERNAME and KAGGLE_KEY must both be set. "
-          "KAGGLE_API_TOKEN alone is not read by the kaggle CLI.", flush=True)
+    print("[config] FATAL: KAGGLE_USERNAME and KAGGLE_KEY must both be set.",
+          flush=True)
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGIN}})
@@ -326,11 +324,6 @@ def last_message(msgs):
 
 
 def kaggle_cli(*args, timeout=60):
-    """Run a kaggle CLI command with a hard timeout that kills the whole
-    process group, not just the top process. The CLI forks subprocesses for
-    network work; killing only the parent leaves grandchildren holding the
-    stdout pipe open and subprocess.run waits forever.
-    """
     env = dict(os.environ)
     proc = subprocess.Popen(
         ["kaggle", *args],
@@ -397,6 +390,29 @@ def write_kernel(code, gpu):
     (BUILD / "kernel-metadata.json").write_text(json.dumps(meta, indent=2))
 
 
+# ---------- Kaggle SDK push (in-process, no subprocess) ----------
+
+def push_kernel_via_sdk():
+    """Push the kernel using Kaggle's Python SDK directly.
+
+    The CLI version of this forks subprocesses that can hang on network
+    calls in ways SIGKILL can't reclaim. The SDK runs in-process, so any
+    hang is on the HTTP client's own timeout, which returns.
+    """
+    try:
+        from kaggle import KaggleApi
+    except Exception as e:
+        return False, f"kaggle SDK import failed: {e}"
+
+    try:
+        api = KaggleApi()
+        api.authenticate()
+        api.kernels_push(str(BUILD))
+        return True, "ok"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
 # ---------- token management ----------
 
 TOKEN_1 = "1"
@@ -436,8 +452,6 @@ def push_slot(slot, minutes, gpu, preferred_token=None):
         return False, {"error": "KAGGLE_KEY is not set on the server."}
     if not slot["topic"]:
         return False, {"error": f"Topic for slot {slot['id']} is not set."}
-    if not shutil.which("kaggle"):
-        return False, {"error": "The kaggle command is not available on this server."}
 
     with SLOTS_LOCK:
         with slot["push_lock"]:
@@ -450,9 +464,10 @@ def push_slot(slot, minutes, gpu, preferred_token=None):
 
             code = build_kernel_code(slot["topic"], minutes, token)
             write_kernel(code, gpu=gpu)
-            rc, out = kaggle_cli("kernels", "push", "-p", str(BUILD),
-                                 "-t", str(minutes * 60 + 300), timeout=120)
-            if rc != 0:
+
+            print(f"[push] submitting {slot['id']} on token {token}", flush=True)
+            ok, out = push_kernel_via_sdk()
+            if not ok:
                 slot["token"] = None
                 print(f"[push] failed for {slot['id']}: {out}", flush=True)
                 return False, {"error": f"Kaggle push failed: {out}"}
@@ -668,7 +683,6 @@ def cpu_rotator():
             gpu_state = slot_state_dict(gpu)
             gpu_active = bool(gpu_state["link"]) or bool(gpu["pushed_at"])
 
-            # bootstrap: nothing running at all
             if (not cpu_primary["link"]
                     and not cpu_primary["pushed_at"]
                     and not spare_state["pushed_at"]
@@ -678,14 +692,12 @@ def cpu_rotator():
                 time.sleep(60)
                 continue
 
-            # spare live -> promote, kill the old primary
             if spare_state["link"]:
                 if not primary_slot["stop_sent"]:
                     hard_kill_slot(primary_slot)
                 time.sleep(60)
                 continue
 
-            # prep stage: push the spare at CPU_SPARE_PREP_MIN
             if (primary_age_min >= CPU_SPARE_PREP_MIN
                     and primary_age_min < CPU_KILL_OLD_MIN
                     and not spare_state["pushed_at"]
@@ -709,7 +721,6 @@ def cpu_rotator():
                 time.sleep(60)
                 continue
 
-            # kill stage: hard kill the primary at CPU_KILL_OLD_MIN
             if primary_age_min >= CPU_KILL_OLD_MIN and not primary_slot["stop_sent"]:
                 hard_kill_slot(primary_slot)
                 time.sleep(60)
@@ -749,7 +760,6 @@ def gpu_watchdog():
 
 
 def link_watcher():
-    """Safety net. If no link and nothing booting, push a CPU on token 1."""
     while True:
         try:
             state_a, state_b = _cpu_states()
