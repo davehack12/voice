@@ -2,7 +2,8 @@
 app.py: the whole voice changer backend, meant to run on Render (or anywhere).
 
 Required environment variables:
-    KAGGLE_API_TOKEN      your Kaggle API token, from kaggle.com/settings/api
+    KAGGLE_USERNAME       your Kaggle username (from kaggle.json)
+    KAGGLE_KEY            your legacy Kaggle API key (from kaggle.json)
     NGROK_AUTHTOKEN_1     first ngrok account authtoken
     NGROK_AUTHTOKEN_2     second ngrok account authtoken
     RVC_NTFY_TOPIC_A      CPU slot 1 ntfy topic (long random string).
@@ -10,7 +11,6 @@ Required environment variables:
     RVC_NTFY_TOPIC_GPU    GPU slot ntfy topic (long random string).
 
 Optional:
-    KAGGLE_USERNAME       default: supporttopal
     KERNEL_SLUG           default: rvc-gpu-server
     CACHE_SLUG            default: rvc-cache
     DATASET               default: supporttopal/sweet-female-rvc
@@ -35,6 +35,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -67,6 +68,8 @@ TOPIC_GPU = os.environ.get("RVC_NTFY_TOPIC_GPU")
 NGROK_TOKEN_1 = os.environ.get("NGROK_AUTHTOKEN_1")
 NGROK_TOKEN_2 = os.environ.get("NGROK_AUTHTOKEN_2")
 
+KAGGLE_KEY = os.environ.get("KAGGLE_KEY")
+
 CPU_RUN_MINUTES      = int(os.environ.get("CPU_RUN_MINUTES", "600"))
 CPU_SPARE_PREP_MIN   = int(os.environ.get("CPU_SPARE_PREP_MIN", "570"))
 CPU_KILL_OLD_MIN     = int(os.environ.get("CPU_KILL_OLD_MIN", "600"))
@@ -82,6 +85,12 @@ CACHE_ID = f"{KAGGLE_USERNAME}/{CACHE_SLUG}"
 DONE = {"COMPLETE", "ERROR", "CANCELACKNOWLEDGED"}
 WORK = Path(tempfile.mkdtemp(prefix="rvc_backend_"))
 BUILD = WORK / "kernel_build"
+
+# Startup sanity check. The CLI needs username + key; without them it hangs
+# on an interactive prompt and the whole push path stalls silently.
+if not KAGGLE_USERNAME or not KAGGLE_KEY:
+    print("[config] FATAL: KAGGLE_USERNAME and KAGGLE_KEY must both be set. "
+          "KAGGLE_API_TOKEN alone is not read by the kaggle CLI.", flush=True)
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGIN}})
@@ -316,16 +325,37 @@ def last_message(msgs):
     return msgs[-1] if msgs else None
 
 
-def kaggle_cli(*args):
-    """Run a kaggle CLI command with a hard timeout so a hanging prompt
-    can't freeze a background thread forever. Returns (rc, output)."""
+def kaggle_cli(*args, timeout=60):
+    """Run a kaggle CLI command with a hard timeout that kills the whole
+    process group, not just the top process. The CLI forks subprocesses for
+    network work; killing only the parent leaves grandchildren holding the
+    stdout pipe open and subprocess.run waits forever.
+    """
     env = dict(os.environ)
+    proc = subprocess.Popen(
+        ["kaggle", *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        start_new_session=True,
+    )
     try:
-        p = subprocess.run(["kaggle", *args], capture_output=True, text=True,
-                           env=env, timeout=60)
+        out, err = proc.communicate(timeout=timeout)
+        return proc.returncode, ((out or "") + (err or "")).strip()
     except subprocess.TimeoutExpired:
-        return 1, f"kaggle {' '.join(args)} timed out after 60s"
-    return p.returncode, (p.stdout + p.stderr).strip()
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            out, err = proc.communicate(timeout=5)
+        except Exception:
+            out, err = "", ""
+        return 1, f"kaggle {' '.join(args)} timed out after {timeout}s"
 
 
 def parse_state(out):
@@ -338,7 +368,7 @@ def parse_state(out):
 def run_state():
     if not shutil.which("kaggle"):
         return None
-    code, out = kaggle_cli("kernels", "status", KERNEL_ID)
+    code, out = kaggle_cli("kernels", "status", KERNEL_ID, timeout=30)
     if code != 0:
         return None
     return parse_state(out)
@@ -402,6 +432,8 @@ def build_kernel_code(topic, minutes, token_name):
 def push_slot(slot, minutes, gpu, preferred_token=None):
     if not NGROK_TOKEN_1 or not NGROK_TOKEN_2:
         return False, {"error": "Both NGROK_AUTHTOKEN_1 and NGROK_AUTHTOKEN_2 must be set."}
+    if not KAGGLE_KEY:
+        return False, {"error": "KAGGLE_KEY is not set on the server."}
     if not slot["topic"]:
         return False, {"error": f"Topic for slot {slot['id']} is not set."}
     if not shutil.which("kaggle"):
@@ -419,7 +451,7 @@ def push_slot(slot, minutes, gpu, preferred_token=None):
             code = build_kernel_code(slot["topic"], minutes, token)
             write_kernel(code, gpu=gpu)
             rc, out = kaggle_cli("kernels", "push", "-p", str(BUILD),
-                                 "-t", str(minutes * 60 + 300))
+                                 "-t", str(minutes * 60 + 300), timeout=120)
             if rc != 0:
                 slot["token"] = None
                 print(f"[push] failed for {slot['id']}: {out}", flush=True)
@@ -717,11 +749,7 @@ def gpu_watchdog():
 
 
 def link_watcher():
-    """Safety net. If no link and nothing booting, push a CPU on token 1.
-
-    Logs the reason for every failure. Backs off exponentially on consecutive
-    failures so a broken Kaggle state doesn't flood the log.
-    """
+    """Safety net. If no link and nothing booting, push a CPU on token 1."""
     while True:
         try:
             state_a, state_b = _cpu_states()
