@@ -35,6 +35,7 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -85,13 +86,11 @@ DONE = {"COMPLETE", "ERROR", "CANCELACKNOWLEDGED"}
 WORK = Path(tempfile.mkdtemp(prefix="rvc_backend_"))
 BUILD = WORK / "kernel_build"
 
-print(f"[config] KAGGLE_USERNAME={KAGGLE_USERNAME!r} KERNEL_SLUG={KERNEL_SLUG!r} "
-      f"KERNEL_ID={KERNEL_ID!r} KEY_SET={bool(KAGGLE_KEY)} "
-      f"NGROK1_SET={bool(NGROK_TOKEN_1)} NGROK2_SET={bool(NGROK_TOKEN_2)}",
-      flush=True)
-
-if not KAGGLE_KEY:
-    print("[config] FATAL: KAGGLE_KEY is not set.", flush=True)
+# Startup sanity check. The CLI needs username + key; without them it hangs
+# on an interactive prompt and the whole push path stalls silently.
+if not KAGGLE_USERNAME or not KAGGLE_KEY:
+    print("[config] FATAL: KAGGLE_USERNAME and KAGGLE_KEY must both be set. "
+          "KAGGLE_API_TOKEN alone is not read by the kaggle CLI.", flush=True)
 
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGIN}})
@@ -102,21 +101,18 @@ CLIENT_CACHE = {"url": None, "client": None, "endpoints": None}
 
 # ---------- runtime state ----------
 
-# RLock, not Lock. push_slot takes this lock and then calls claim_token,
-# which also takes it. A plain Lock deadlocks on the second acquire from the
-# same thread. RLock allows the nested acquire.
 SLOTS_LOCK = threading.RLock()
 
 SLOTS = [
     {"id": "cpu_a", "kind": "cpu", "topic": TOPIC_A, "pushed_at": 0,
      "push_lock": threading.Lock(), "stop_sent": False, "token": None,
-     "hard_killed_at": 0},
+     "hard_killed_at": 0, "kernel_id": f"{KAGGLE_USERNAME}/{KERNEL_SLUG}-cpu-a"},
     {"id": "cpu_b", "kind": "cpu", "topic": TOPIC_B, "pushed_at": 0,
      "push_lock": threading.Lock(), "stop_sent": False, "token": None,
-     "hard_killed_at": 0},
+     "hard_killed_at": 0, "kernel_id": f"{KAGGLE_USERNAME}/{KERNEL_SLUG}-cpu-b"},
     {"id": "gpu",   "kind": "gpu", "topic": TOPIC_GPU, "pushed_at": 0,
      "push_lock": threading.Lock(), "stop_sent": False, "token": None,
-     "hard_killed_at": 0},
+     "hard_killed_at": 0, "kernel_id": f"{KAGGLE_USERNAME}/{KERNEL_SLUG}-gpu"},
 ]
 SLOT_BY_ID = {s["id"]: s for s in SLOTS}
 
@@ -329,25 +325,37 @@ def last_message(msgs):
     return msgs[-1] if msgs else None
 
 
-def kaggle_cli(*args, timeout=120):
+def kaggle_cli(*args, timeout=60):
+    """Run a kaggle CLI command with a hard timeout that kills the whole
+    process group, not just the top process. The CLI forks subprocesses for
+    network work; killing only the parent leaves grandchildren holding the
+    stdout pipe open and subprocess.run waits forever.
+    """
     env = dict(os.environ)
+    proc = subprocess.Popen(
+        ["kaggle", *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        start_new_session=True,
+    )
     try:
-        p = subprocess.run(
-            ["kaggle", *args],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=env,
-            timeout=timeout,
-            start_new_session=True,
-        )
-        return p.returncode, (p.stdout or "").strip()
+        out, err = proc.communicate(timeout=timeout)
+        return proc.returncode, ((out or "") + (err or "")).strip()
     except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            out, err = proc.communicate(timeout=5)
+        except Exception:
+            out, err = "", ""
         return 1, f"kaggle {' '.join(args)} timed out after {timeout}s"
-    except FileNotFoundError as e:
-        return 1, f"kaggle CLI not found: {e}"
-    except Exception as e:
-        return 1, f"{type(e).__name__}: {e}"
 
 
 def parse_state(out):
@@ -357,10 +365,10 @@ def parse_state(out):
     return m.group(1).split(".")[-1].replace("_", "").upper()
 
 
-def run_state():
+def run_state(kernel_id=None):
     if not shutil.which("kaggle"):
         return None
-    code, out = kaggle_cli("kernels", "status", KERNEL_ID, timeout=30)
+    code, out = kaggle_cli("kernels", "status", kernel_id or KERNEL_ID, timeout=30)
     if code != 0:
         return None
     return parse_state(out)
@@ -370,12 +378,12 @@ def is_active(s):
     return s is not None and s not in DONE
 
 
-def write_kernel(code, gpu):
-    BUILD.mkdir(exist_ok=True)
-    (BUILD / "script.py").write_text(code)
+def write_kernel(kernel_id, code, gpu, build_dir):
+    build_dir.mkdir(parents=True, exist_ok=True)
+    (build_dir / "script.py").write_text(code)
     meta = {
-        "id": KERNEL_ID,
-        "title": KERNEL_SLUG.replace("-", " "),
+        "id": kernel_id,
+        "title": kernel_id.split("/")[-1].replace("-", " "),
         "code_file": "script.py",
         "language": "python",
         "kernel_type": "script",
@@ -386,7 +394,7 @@ def write_kernel(code, gpu):
         "competition_sources": [],
         "kernel_sources": [CACHE_ID],
     }
-    (BUILD / "kernel-metadata.json").write_text(json.dumps(meta, indent=2))
+    (build_dir / "kernel-metadata.json").write_text(json.dumps(meta, indent=2))
 
 
 # ---------- token management ----------
@@ -422,47 +430,37 @@ def build_kernel_code(topic, minutes, token_name):
 
 
 def push_slot(slot, minutes, gpu, preferred_token=None):
-    print(f"[push] entering push_slot for {slot['id']}", flush=True)
-
     if not NGROK_TOKEN_1 or not NGROK_TOKEN_2:
-        print("[push] rejected: missing ngrok tokens", flush=True)
         return False, {"error": "Both NGROK_AUTHTOKEN_1 and NGROK_AUTHTOKEN_2 must be set."}
     if not KAGGLE_KEY:
-        print("[push] rejected: missing KAGGLE_KEY", flush=True)
         return False, {"error": "KAGGLE_KEY is not set on the server."}
     if not slot["topic"]:
-        print(f"[push] rejected: missing topic for {slot['id']}", flush=True)
         return False, {"error": f"Topic for slot {slot['id']} is not set."}
+    if not shutil.which("kaggle"):
+        return False, {"error": "The kaggle command is not available on this server."}
 
     with SLOTS_LOCK:
         with slot["push_lock"]:
             if slot["pushed_at"]:
-                print(f"[push] rejected: {slot['id']} already pushed", flush=True)
                 return False, {"error": "This slot was already pushed recently."}
 
             token = claim_token(slot, preferred=preferred_token)
             if not token:
-                print("[push] rejected: no ngrok token free", flush=True)
                 return False, {"error": "No ngrok token free. Both slots are holding one."}
 
             code = build_kernel_code(slot["topic"], minutes, token)
-            write_kernel(code, gpu=gpu)
-
-            print(f"[push] submitting {slot['id']} on token {token}", flush=True)
-            rc, out = kaggle_cli(
-                "kernels", "push", "-p", str(BUILD),
-                "-t", str(minutes * 60 + 300),
-                timeout=120,
-            )
+            build_dir = WORK / "kernel_build" / slot["id"]
+            write_kernel(slot["kernel_id"], code, gpu=gpu, build_dir=build_dir)
+            rc, out = kaggle_cli("kernels", "push", "-p", str(build_dir),
+                                 "-t", str(minutes * 60 + 300), timeout=120)
             if rc != 0:
                 slot["token"] = None
                 print(f"[push] failed for {slot['id']}: {out}", flush=True)
                 return False, {"error": f"Kaggle push failed: {out}"}
-
             slot["pushed_at"] = int(time.time())
             slot["stop_sent"] = False
             slot["hard_killed_at"] = 0
-            print(f"[push] ok for {slot['id']} on token {token}: {out[:200]}", flush=True)
+            print(f"[push] ok for {slot['id']} on token {token}", flush=True)
             return True, {"kaggle_output": out, "token": token}
 
 
@@ -527,6 +525,7 @@ def hard_kill_slot(slot):
         slot["stop_sent"] = True
         slot["pushed_at"] = 0
         slot["hard_killed_at"] = int(time.time())
+        slot["token"] = None
         try:
             ntfy_send(slot["topic"], "STOP")
         except Exception:
@@ -578,7 +577,7 @@ def current_status():
         primary = "cpu"
         link = cpu_primary["link"]
 
-    kaggle = run_state()
+    kaggle = run_state(SLOT_BY_ID[primary if primary == "gpu" else cpu_primary["id"]]["kernel_id"])
 
     if cpu_spare["link"]:
         cpu_spare_state = "ready"
@@ -671,6 +670,7 @@ def cpu_rotator():
             gpu_state = slot_state_dict(gpu)
             gpu_active = bool(gpu_state["link"]) or bool(gpu["pushed_at"])
 
+            # bootstrap: nothing running at all
             if (not cpu_primary["link"]
                     and not cpu_primary["pushed_at"]
                     and not spare_state["pushed_at"]
@@ -680,12 +680,14 @@ def cpu_rotator():
                 time.sleep(60)
                 continue
 
+            # spare live -> promote, kill the old primary
             if spare_state["link"]:
                 if not primary_slot["stop_sent"]:
                     hard_kill_slot(primary_slot)
                 time.sleep(60)
                 continue
 
+            # prep stage: push the spare at CPU_SPARE_PREP_MIN
             if (primary_age_min >= CPU_SPARE_PREP_MIN
                     and primary_age_min < CPU_KILL_OLD_MIN
                     and not spare_state["pushed_at"]
@@ -709,6 +711,7 @@ def cpu_rotator():
                 time.sleep(60)
                 continue
 
+            # kill stage: hard kill the primary at CPU_KILL_OLD_MIN
             if primary_age_min >= CPU_KILL_OLD_MIN and not primary_slot["stop_sent"]:
                 hard_kill_slot(primary_slot)
                 time.sleep(60)
@@ -748,6 +751,7 @@ def gpu_watchdog():
 
 
 def link_watcher():
+    """Safety net. If no link and nothing booting, push a CPU on token 1."""
     while True:
         try:
             state_a, state_b = _cpu_states()
