@@ -19,10 +19,10 @@ Optional:
     VOICE_INDEX           default: logs/sweet_female/sweet_female.index
     ALLOWED_ORIGIN        default: *
     CPU_RUN_MINUTES       default: 600
-    CPU_SPARE_PREP_MIN    default: 570    (9h30m; when to push the spare)
-    CPU_KILL_OLD_MIN      default: 600    (10h; when to hard-kill the primary)
+    CPU_SPARE_PREP_MIN    default: 570
+    CPU_KILL_OLD_MIN      default: 600
     GPU_RUN_MINUTES       default: 40
-    GPU_MAX_EXTENDED_MIN  default: 90     (absolute cap if GPU waits for CPU)
+    GPU_MAX_EXTENDED_MIN  default: 90
     GPU_DAILY_RUNS        default: 6
     START_ON_BOOT         default: 0
     STATUS_TTL_SECONDS    default: 8
@@ -113,12 +113,10 @@ UPGRADE_LOG_LOCK = threading.Lock()
 STATUS_CACHE = {"at": 0.0, "value": None}
 STATUS_CACHE_LOCK = threading.Lock()
 
-# When the GPU is asked to hold on because a CPU handover is in progress,
-# this records the deadline (unix time) past which the GPU is killed
-# regardless. Set when the GPU's normal 40 min cap is up but no CPU link is
-# live yet.
 GPU_HOLD_UNTIL = {"at": 0}
 
+WATCHER_FAILS = {"count": 0, "last_log": 0}
+WATCHER_MAX_BACKOFF = 300
 
 # ---------- kernel template ----------
 
@@ -412,16 +410,26 @@ def push_slot(slot, minutes, gpu, preferred_token=None):
             if not token:
                 return False, {"error": "No ngrok token free. Both slots are holding one."}
 
+            # If the kernel is stuck in a terminal error state, Kaggle refuses
+            # a new push. Delete clears it. `-y` suppresses the prompt.
+            state = run_state()
+            if state in ("ERROR", "CANCELLED", "CANCELED"):
+                print(f"[push] kernel in {state}, deleting before push", flush=True)
+                kaggle_cli("kernels", "delete", "-y", KERNEL_ID)
+                time.sleep(3)
+
             code = build_kernel_code(slot["topic"], minutes, token)
             write_kernel(code, gpu=gpu)
             rc, out = kaggle_cli("kernels", "push", "-p", str(BUILD),
                                  "-t", str(minutes * 60 + 300))
             if rc != 0:
                 slot["token"] = None
+                print(f"[push] failed for {slot['id']}: {out}", flush=True)
                 return False, {"error": f"Kaggle push failed: {out}"}
             slot["pushed_at"] = int(time.time())
             slot["stop_sent"] = False
             slot["hard_killed_at"] = 0
+            print(f"[push] ok for {slot['id']} on token {token}", flush=True)
             return True, {"kaggle_output": out, "token": token}
 
 
@@ -476,25 +484,13 @@ def upgrades_remaining():
 
 
 # ---------- hard kill ----------
-#
-# "Kill it, don't wait for it to stop". Send STOP twice, mark the slot as
-# killed. A kernel that already exited sees a STOP it ignores. A kernel that
-# is still alive gets it and shuts down within 15s (its watchdog polls every
-# 15 seconds and calls os._exit(0)).
-#
-# Verification is done by the caller: after hard_kill, we wait up to
-# KILL_VERIFY_SECONDS for the slot's link to disappear from ntfy (which
-# happens the moment the kernel posts STATUS finished) OR for it to go past
-# a generous timeout, whichever comes first. We don't block the rotator; the
-# rotator only checks `slot["pushed_at"]` before deciding to push again.
 
 KILL_VERIFY_SECONDS = 90
 
 def hard_kill_slot(slot):
-    """Send STOP, mark killed. Does not wait."""
     with SLOTS_LOCK:
         if slot["stop_sent"] and slot["pushed_at"] == 0:
-            return  # already killed
+            return
         slot["stop_sent"] = True
         slot["pushed_at"] = 0
         slot["hard_killed_at"] = int(time.time())
@@ -502,8 +498,7 @@ def hard_kill_slot(slot):
             ntfy_send(slot["topic"], "STOP")
         except Exception:
             pass
-        # Second STOP after a short pause catches a kernel whose watchdog
-        # missed the first (network hiccup on the poll).
+
         def second():
             time.sleep(4)
             try:
@@ -514,8 +509,6 @@ def hard_kill_slot(slot):
 
 
 def confirm_dead(slot, timeout=KILL_VERIFY_SECONDS):
-    """Wait up to `timeout` seconds for the slot's link to clear.
-    Returns True if it cleared, False if the timeout hit."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         if slot_link(slot) is None:
@@ -620,24 +613,6 @@ def _cpu_states():
 
 
 def cpu_rotator():
-    """
-    Handover rules, in order of precedence.
-
-    At CPU_SPARE_PREP_MIN (default 9h30m):
-        Push the spare on the other ngrok token. Both tunnels live at once.
-        Nothing is killed yet.
-
-    At CPU_KILL_OLD_MIN (default 10h):
-        Hard-kill the aging primary, no waiting. Verify death via ntfy.
-        The spare should already have a live LINK by now (30 minutes was
-        enough to boot). If it doesn't, the fresh CPU slot is on its own
-        and the link_watcher will retry.
-
-    If the GPU is running at CPU_SPARE_PREP_MIN:
-        Still prep the spare CPU on the token the GPU is NOT using. The GPU
-        continues serving on its token. When the CPU spare is live, we wait
-        for the GPU to hit its own cap and die, then the CPU becomes primary.
-    """
     while True:
         try:
             if not (TOPIC_A and TOPIC_B):
@@ -663,7 +638,7 @@ def cpu_rotator():
             gpu_state = slot_state_dict(gpu)
             gpu_active = bool(gpu_state["link"]) or bool(gpu["pushed_at"])
 
-            # ---- bootstrap: nothing running at all ----
+            # bootstrap: nothing running at all
             if (not cpu_primary["link"]
                     and not cpu_primary["pushed_at"]
                     and not spare_state["pushed_at"]
@@ -673,15 +648,14 @@ def cpu_rotator():
                 time.sleep(60)
                 continue
 
-            # ---- spare live -> promote, kill the old primary now ----
-            # This runs on the tick after the spare posts its LINK.
+            # spare live -> promote, kill the old primary
             if spare_state["link"]:
                 if not primary_slot["stop_sent"]:
                     hard_kill_slot(primary_slot)
                 time.sleep(60)
                 continue
 
-            # ---- prep stage: push the spare at CPU_SPARE_PREP_MIN ----
+            # prep stage: push the spare at CPU_SPARE_PREP_MIN
             if (primary_age_min >= CPU_SPARE_PREP_MIN
                     and primary_age_min < CPU_KILL_OLD_MIN
                     and not spare_state["pushed_at"]
@@ -690,21 +664,12 @@ def cpu_rotator():
                 primary_token = cpu_primary.get("token")
                 preferred = TOKEN_2 if primary_token == TOKEN_1 else TOKEN_1
 
-                # GPU holds one token. If the GPU is on the primary's token,
-                # use the GPU's token for the CPU spare (the GPU will die on
-                # its own cap before the CPU needs to be primary). If the GPU
-                # is on the *other* token, use the primary's token-free side.
                 if gpu_active and gpu.get("token") == preferred:
-                    # The token we wanted is held by the GPU. Use whatever
-                    # the primary is holding — the primary is about to die
-                    # anyway, so its tunnel going down at 10h frees it.
                     preferred = primary_token
 
                 ok, _ = push_slot(spare, CPU_RUN_MINUTES, gpu=False,
                                   preferred_token=preferred)
                 if not ok:
-                    # No token free. Kill the primary now, free its token,
-                    # push the spare. Brief gap, unavoidable.
                     hard_kill_slot(primary_slot)
                     time.sleep(6)
                     freed = primary_slot["token"]
@@ -714,24 +679,18 @@ def cpu_rotator():
                 time.sleep(60)
                 continue
 
-            # ---- kill stage: hard kill the primary at CPU_KILL_OLD_MIN ----
+            # kill stage: hard kill the primary at CPU_KILL_OLD_MIN
             if primary_age_min >= CPU_KILL_OLD_MIN and not primary_slot["stop_sent"]:
                 hard_kill_slot(primary_slot)
                 time.sleep(60)
                 continue
 
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[rotator] exception: {e}", flush=True)
         time.sleep(60)
 
 
 def gpu_watchdog():
-    """
-    Kill the GPU when it hits GPU_RUN_MINUTES, unless the CPU spare is not
-    yet live. In that case the GPU is allowed to keep serving up to
-    GPU_MAX_EXTENDED_MIN. The moment a CPU link appears, kill the GPU
-    immediately so the CPU takes over.
-    """
     while True:
         try:
             gpu = SLOT_BY_ID["gpu"]
@@ -743,27 +702,28 @@ def gpu_watchdog():
                     slot_link(SLOT_BY_ID["cpu_a"]) or slot_link(SLOT_BY_ID["cpu_b"])
                 )
 
-                # Normal cap reached. If a CPU is already live, die now.
                 if elapsed_min >= GPU_RUN_MINUTES:
                     if cpu_link_live:
                         hard_kill_slot(gpu)
                     else:
-                        # No CPU yet. Extend, but only to the hard ceiling.
                         if elapsed_min >= GPU_MAX_EXTENDED_MIN:
                             hard_kill_slot(gpu)
                         else:
-                            # Stamp the hold time once so we can log it.
                             if not GPU_HOLD_UNTIL["at"]:
                                 GPU_HOLD_UNTIL["at"] = int(time.time())
                 else:
                     GPU_HOLD_UNTIL["at"] = 0
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[gpu-watchdog] exception: {e}", flush=True)
         time.sleep(60)
 
 
 def link_watcher():
-    """Safety net. If no link and nothing booting, push a CPU on token 1."""
+    """Safety net. If no link and nothing booting, push a CPU on token 1.
+
+    Logs the reason for every failure so we can see what Kaggle is refusing.
+    Backs off exponentially on consecutive failures so we don't hammer the API.
+    """
     while True:
         try:
             state_a, state_b = _cpu_states()
@@ -774,12 +734,28 @@ def link_watcher():
                 state_a["pushed_at"] or state_b["pushed_at"] or gpu["pushed_at"]
             )
 
+            print(f"[watcher] tick link={any_link} push={any_push}", flush=True)
+
             if not any_link and not any_push:
                 cpu_primary = _pick_cpu_primary(state_a, state_b)
-                push_slot(SLOT_BY_ID[cpu_primary["id"]], CPU_RUN_MINUTES,
-                          gpu=False, preferred_token=TOKEN_1)
-        except Exception:
-            pass
+                print(f"[watcher] attempting push to {cpu_primary['id']}", flush=True)
+                ok, info = push_slot(SLOT_BY_ID[cpu_primary["id"]],
+                                     CPU_RUN_MINUTES,
+                                     gpu=False, preferred_token=TOKEN_1)
+                if ok:
+                    WATCHER_FAILS["count"] = 0
+                    print(f"[watcher] push ok: {info}", flush=True)
+                else:
+                    WATCHER_FAILS["count"] += 1
+                    now = time.time()
+                    if now - WATCHER_FAILS["last_log"] > 30:
+                        WATCHER_FAILS["last_log"] = now
+                        print(f"[watcher] push failed ({WATCHER_FAILS['count']} in a row): {info.get('error')}", flush=True)
+                    backoff = min(WATCHER_MAX_BACKOFF, WATCHER_FAILS["count"] * 30)
+                    time.sleep(backoff)
+                    continue
+        except Exception as e:
+            print(f"[watcher] exception: {e}", flush=True)
         time.sleep(30)
 
 
@@ -894,211 +870,4 @@ def start():
                    kaggle_output=info.get("kaggle_output"))
 
 
-@app.post("/api/stop")
-def stop():
-    if not TOPIC_A or not TOPIC_B or not TOPIC_GPU:
-        return fail("One or more RVC_NTFY_TOPIC_* variables are missing.", 500)
-
-    for slot in SLOTS:
-        hard_kill_slot(slot)
-    CLIENT_CACHE.update(url=None, client=None, endpoints=None)
-    with STATUS_CACHE_LOCK:
-        STATUS_CACHE["value"] = None
-        STATUS_CACHE["at"] = 0.0
-    return jsonify(ok=True, message="Stop sent to all slots.")
-
-
-@app.post("/api/upgrade-gpu")
-def upgrade_gpu():
-    if not TOPIC_GPU:
-        return fail("RVC_NTFY_TOPIC_GPU is not set on the server.", 500)
-
-    gpu = SLOT_BY_ID["gpu"]
-    state_g = slot_state_dict(gpu)
-
-    if state_g["link"] or gpu["pushed_at"]:
-        return jsonify(ok=True, already_running=True,
-                       message="GPU is already running or booting.",
-                       **cached_status())
-
-    allowed, remaining = record_gpu_upgrade()
-    if not allowed:
-        return fail(f"Daily GPU limit reached. Try again later. Remaining: {remaining}.", 429)
-
-    cpu_primary = _pick_cpu_primary(*_cpu_states())
-    primary_token = cpu_primary.get("token")
-    preferred = TOKEN_2 if primary_token == TOKEN_1 else TOKEN_1
-
-    ok, info = push_slot(gpu, GPU_RUN_MINUTES, gpu=True, preferred_token=preferred)
-    if not ok:
-        return fail(info.get("error", "GPU push failed"), 500)
-
-    GPU_HOLD_UNTIL["at"] = 0
-
-    with STATUS_CACHE_LOCK:
-        STATUS_CACHE["value"] = None
-        STATUS_CACHE["at"] = 0.0
-
-    return jsonify(ok=True, already_running=False,
-                   message="GPU push submitted. The 40-minute window starts now.",
-                   gpu_upgrades_remaining=remaining,
-                   kaggle_output=info.get("kaggle_output"))
-
-
-@app.get("/api/voices")
-def voices():
-    try:
-        def go(client, found, meta):
-            infer_meta = meta[found["infer"]]
-            tts_meta = meta[found["tts"]] if found["tts"] else None
-            out = {
-                "f0_methods": infer_meta["choices"][I_INFER["f0"]] or ["rmvpe"],
-                "export_formats": infer_meta["choices"][I_INFER["fmt"]] or ["WAV"],
-                "model": VOICE_MODEL,
-                "index": VOICE_INDEX,
-            }
-            if tts_meta:
-                out["tts_voices"] = tts_meta["choices"][I_TTS["voice"]] or []
-                out["tts_available"] = True
-            else:
-                out["tts_voices"] = []
-                out["tts_available"] = False
-            return out
-        return jsonify(ok=True, **with_reconnect(go))
-    except Exception as e:
-        return fail(e, 502)
-
-
-@app.post("/api/convert")
-def convert():
-    f = request.files.get("audio")
-    if not f:
-        return fail("Attach an audio file as 'audio'.")
-    try:
-        cfg = json.loads(request.form.get("settings", "{}"))
-    except ValueError:
-        return fail("Bad settings JSON.")
-
-    ext = Path(f.filename or "").suffix.lower()
-    ext = ext if re.fullmatch(r"\.[a-z0-9]{2,5}", ext) else ".wav"
-    src = WORK / f"in_{secrets.token_hex(4)}{ext}"
-    f.save(src)
-
-    def go(client, found, meta):
-        args = list(meta[found["infer"]]["defaults"])
-        with CONVERT_LOCK:
-            up = client.predict(handle_file(str(src)), api_name=found["save"])
-            args[I_INFER["terms"]] = True
-            args[I_INFER["audio"]] = as_value(up[0])
-            args[I_INFER["output"]] = as_value(up[1])
-            args[I_INFER["pitch"]] = int(cfg.get("pitch", 10))
-            args[I_INFER["index_rate"]] = float(cfg.get("index_rate", 0.3))
-            if "volume" in cfg:
-                args[I_INFER["volume"]] = float(cfg["volume"])
-            if "protect" in cfg:
-                args[I_INFER["protect"]] = float(cfg["protect"])
-            if cfg.get("f0"):
-                args[I_INFER["f0"]] = cfg["f0"]
-            if cfg.get("fmt"):
-                args[I_INFER["fmt"]] = cfg["fmt"]
-            for key in ("split", "autotune", "clean"):
-                if key in cfg:
-                    args[I_INFER[key]] = bool(cfg[key])
-            if "clean_strength" in cfg:
-                args[I_INFER["clean_strength"]] = float(cfg["clean_strength"])
-            args[I_INFER["model"]] = VOICE_MODEL
-            args[I_INFER["index"]] = VOICE_INDEX
-            return client.predict(*args, api_name=found["infer"])
-
-    try:
-        res = with_reconnect(go)
-    except Exception as e:
-        return fail(f"Conversion failed: {e}", 502)
-    finally:
-        src.unlink(missing_ok=True)
-    return _store_result(res)
-
-
-@app.post("/api/tts")
-def tts():
-    body = request.get_json(silent=True) or {}
-    text = (body.get("text") or "").strip()
-    if not text:
-        return fail("Send some 'text' to speak.")
-    cfg = body.get("settings", {})
-
-    def go(client, found, meta):
-        if not found["tts"]:
-            raise RuntimeError("This Applio session has no text to speech tab.")
-        args = list(meta[found["tts"]]["defaults"])
-        with CONVERT_LOCK:
-            args[I_TTS["terms"]] = True
-            args[I_TTS["text"]] = text
-            if cfg.get("voice"):
-                args[I_TTS["voice"]] = cfg["voice"]
-            if "rate" in cfg:
-                args[I_TTS["rate"]] = int(cfg["rate"])
-            args[I_TTS["pitch"]] = int(cfg.get("pitch", 10))
-            args[I_TTS["index_rate"]] = float(cfg.get("index_rate", 0.3))
-            if "protect" in cfg:
-                args[I_TTS["protect"]] = float(cfg["protect"])
-            if cfg.get("f0"):
-                args[I_TTS["f0"]] = cfg["f0"]
-            if cfg.get("fmt"):
-                args[I_TTS["fmt"]] = cfg["fmt"]
-            args[I_TTS["model"]] = VOICE_MODEL
-            args[I_TTS["index"]] = VOICE_INDEX
-            return client.predict(*args, api_name=found["tts"])
-
-    try:
-        res = with_reconnect(go)
-    except Exception as e:
-        return fail(f"Text to speech failed: {e}", 502)
-    return _store_result(res)
-
-
-def _store_result(res):
-    message, out = res[0], as_value(res[1])
-    if not out or not os.path.exists(str(out)):
-        return fail(message or "Applio returned no audio.", 502)
-    rid = secrets.token_hex(6)
-    dest = WORK / f"out_{rid}{Path(str(out)).suffix or '.wav'}"
-    shutil.copy(str(out), dest)
-    RESULTS[rid] = dest
-    return jsonify(ok=True, id=rid, message=message)
-
-
-@app.get("/api/result/<rid>")
-def result(rid):
-    p = RESULTS.get(rid)
-    if not p or not p.exists():
-        return fail("Result not found (the server may have restarted since it was made).", 404)
-    mime = mimetypes.guess_type(str(p))[0] or "audio/wav"
-    return send_file(p, mimetype=mime, as_attachment=bool(request.args.get("dl")),
-                     download_name=f"converted_{rid}{p.suffix}")
-
-
-# ---------- boot ----------
-
-def _boot():
-    if START_ON_BOOT:
-        try:
-            time.sleep(5)
-            state_a, state_b = _cpu_states()
-            primary = _pick_cpu_primary(state_a, state_b)
-            if not primary["link"] and not primary["pushed_at"]:
-                push_slot(SLOT_BY_ID[primary["id"]], CPU_RUN_MINUTES,
-                          gpu=False, preferred_token=TOKEN_1)
-        except Exception:
-            pass
-
-
-threading.Thread(target=cpu_rotator, daemon=True).start()
-threading.Thread(target=gpu_watchdog, daemon=True).start()
-threading.Thread(target=link_watcher, daemon=True).start()
-threading.Thread(target=_boot, daemon=True).start()
-
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+@app.post
