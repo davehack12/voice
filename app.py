@@ -1,14 +1,15 @@
 """
 app.py: the whole voice changer backend, meant to run on Render (or anywhere).
 
-Required environment variables (set these in Render's dashboard, never in code):
+Required environment variables:
     KAGGLE_API_TOKEN      your Kaggle API token, from kaggle.com/settings/api
-    NGROK_AUTHTOKEN       your ngrok authtoken, from dashboard.ngrok.com.
+    NGROK_AUTHTOKEN_1     first ngrok account authtoken
+    NGROK_AUTHTOKEN_2     second ngrok account authtoken
     RVC_NTFY_TOPIC_A      CPU slot 1 ntfy topic (long random string).
     RVC_NTFY_TOPIC_B      CPU slot 2 ntfy topic (long random string).
     RVC_NTFY_TOPIC_GPU    GPU slot ntfy topic (long random string).
 
-Optional environment variables (sensible defaults are used otherwise):
+Optional:
     KAGGLE_USERNAME       default: supporttopal
     KERNEL_SLUG           default: rvc-gpu-server
     CACHE_SLUG            default: rvc-cache
@@ -18,12 +19,14 @@ Optional environment variables (sensible defaults are used otherwise):
     VOICE_INDEX           default: logs/sweet_female/sweet_female.index
     ALLOWED_ORIGIN        default: *
     CPU_RUN_MINUTES       default: 600
-    CPU_SWAP_AFTER_MIN    default: 570
+    CPU_SPARE_PREP_MIN    default: 570    (9h30m; when to push the spare)
+    CPU_KILL_OLD_MIN      default: 600    (10h; when to hard-kill the primary)
     GPU_RUN_MINUTES       default: 40
+    GPU_MAX_EXTENDED_MIN  default: 90     (absolute cap if GPU waits for CPU)
     GPU_DAILY_RUNS        default: 6
     START_ON_BOOT         default: 0
-    STATUS_TTL_SECONDS    default: 8     (how long a status response is cached)
-    NTFY_HISTORY_SECONDS  default: 43200 (12h; how much topic history we pull)
+    STATUS_TTL_SECONDS    default: 8
+    NTFY_HISTORY_SECONDS  default: 43200
 """
 import glob
 import json
@@ -61,15 +64,18 @@ TOPIC_A = os.environ.get("RVC_NTFY_TOPIC_A")
 TOPIC_B = os.environ.get("RVC_NTFY_TOPIC_B")
 TOPIC_GPU = os.environ.get("RVC_NTFY_TOPIC_GPU")
 
-CPU_RUN_MINUTES     = int(os.environ.get("CPU_RUN_MINUTES", "600"))
-CPU_SWAP_AFTER_MIN  = int(os.environ.get("CPU_SWAP_AFTER_MIN", "570"))
-GPU_RUN_MINUTES     = int(os.environ.get("GPU_RUN_MINUTES", "40"))
-GPU_DAILY_RUNS      = int(os.environ.get("GPU_DAILY_RUNS", "6"))
-START_ON_BOOT       = os.environ.get("START_ON_BOOT", "0") == "1"
-STATUS_TTL_SECONDS  = int(os.environ.get("STATUS_TTL_SECONDS", "8"))
-NTFY_HISTORY_SECONDS = int(os.environ.get("NTFY_HISTORY_SECONDS", "43200"))
+NGROK_TOKEN_1 = os.environ.get("NGROK_AUTHTOKEN_1")
+NGROK_TOKEN_2 = os.environ.get("NGROK_AUTHTOKEN_2")
 
-NGROK_TOKEN = os.environ.get("NGROK_AUTHTOKEN")
+CPU_RUN_MINUTES      = int(os.environ.get("CPU_RUN_MINUTES", "600"))
+CPU_SPARE_PREP_MIN   = int(os.environ.get("CPU_SPARE_PREP_MIN", "570"))
+CPU_KILL_OLD_MIN     = int(os.environ.get("CPU_KILL_OLD_MIN", "600"))
+GPU_RUN_MINUTES      = int(os.environ.get("GPU_RUN_MINUTES", "40"))
+GPU_MAX_EXTENDED_MIN = int(os.environ.get("GPU_MAX_EXTENDED_MIN", "90"))
+GPU_DAILY_RUNS       = int(os.environ.get("GPU_DAILY_RUNS", "6"))
+START_ON_BOOT        = os.environ.get("START_ON_BOOT", "0") == "1"
+STATUS_TTL_SECONDS   = int(os.environ.get("STATUS_TTL_SECONDS", "8"))
+NTFY_HISTORY_SECONDS = int(os.environ.get("NTFY_HISTORY_SECONDS", "43200"))
 
 KERNEL_ID = f"{KAGGLE_USERNAME}/{KERNEL_SLUG}"
 CACHE_ID = f"{KAGGLE_USERNAME}/{CACHE_SLUG}"
@@ -90,29 +96,31 @@ SLOTS_LOCK = threading.Lock()
 
 SLOTS = [
     {"id": "cpu_a", "kind": "cpu", "topic": TOPIC_A, "pushed_at": 0,
-     "push_lock": threading.Lock(), "stop_sent": False},
+     "push_lock": threading.Lock(), "stop_sent": False, "token": None,
+     "hard_killed_at": 0},
     {"id": "cpu_b", "kind": "cpu", "topic": TOPIC_B, "pushed_at": 0,
-     "push_lock": threading.Lock(), "stop_sent": False},
+     "push_lock": threading.Lock(), "stop_sent": False, "token": None,
+     "hard_killed_at": 0},
     {"id": "gpu",   "kind": "gpu", "topic": TOPIC_GPU, "pushed_at": 0,
-     "push_lock": threading.Lock(), "stop_sent": False},
+     "push_lock": threading.Lock(), "stop_sent": False, "token": None,
+     "hard_killed_at": 0},
 ]
 SLOT_BY_ID = {s["id"]: s for s in SLOTS}
 
 UPGRADE_LOG = []
 UPGRADE_LOG_LOCK = threading.Lock()
 
-# ---------- status cache ----------
-#
-# current_status() costs four outbound calls: three ntfy reads plus a kaggle
-# CLI subprocess. Doing that per /api/status hit means every polling browser
-# tab triggers four requests every 10s, which queues up on Render's free tier
-# and makes the endpoint feel stuck.
-#
-# Cache the computed dict for a short window and serve everyone from the
-# cached copy. Invalidation is by TTL only; nothing else has to know.
 STATUS_CACHE = {"at": 0.0, "value": None}
 STATUS_CACHE_LOCK = threading.Lock()
 
+# When the GPU is asked to hold on because a CPU handover is in progress,
+# this records the deadline (unix time) past which the GPU is killed
+# regardless. Set when the GPU's normal 40 min cap is up but no CPU link is
+# live yet.
+GPU_HOLD_UNTIL = {"at": 0}
+
+
+# ---------- kernel template ----------
 
 KERNEL_TEMPLATE = r"""
 import glob, json, os, re, shutil, subprocess, sys, threading, time, urllib.request
@@ -272,13 +280,6 @@ def fail(message, code=400):
 # ---------- ntfy + kaggle helpers ----------
 
 def ntfy_read(topic):
-    """Read recent messages from a topic.
-
-    Pulling `since=all` meant the response grew every time a kernel ran, and
-    the backend parsed weeks of dead runs on every status call. We only ever
-    care about the current run, so cap the window. NTFY_HISTORY_SECONDS
-    defaults to 12 hours, which covers the longest allowed run.
-    """
     since_ts = int(time.time() - NTFY_HISTORY_SECONDS)
     url = f"{NTFY}/{topic}/json?poll=1&since={since_ts}"
     try:
@@ -362,21 +363,41 @@ def write_kernel(code, gpu):
     (BUILD / "kernel-metadata.json").write_text(json.dumps(meta, indent=2))
 
 
+# ---------- token management ----------
+
+TOKEN_1 = "1"
+TOKEN_2 = "2"
+
+def token_value(name):
+    return NGROK_TOKEN_1 if name == TOKEN_1 else NGROK_TOKEN_2
+
+def claim_token(slot, preferred=None):
+    with SLOTS_LOCK:
+        held = {s["token"] for s in SLOTS if s is not slot and s["token"]}
+        if preferred and preferred not in held:
+            slot["token"] = preferred
+            return preferred
+        for t in (TOKEN_1, TOKEN_2):
+            if t not in held:
+                slot["token"] = t
+                return t
+    return None
+
+
 # ---------- slot bookkeeping ----------
 
-def build_kernel_code(topic, minutes):
+def build_kernel_code(topic, minutes, token_name):
     return (KERNEL_TEMPLATE
             .replace("__TOPIC__", topic)
             .replace("__MINUTES__", str(minutes))
             .replace("__USE_CACHE__", "True")
             .replace("__MODEL_NAME__", MODEL_NAME)
-            .replace("__NGROK__", NGROK_TOKEN or ""))
+            .replace("__NGROK__", token_value(token_name) or ""))
 
 
-def push_slot(slot, minutes, gpu):
-    """Push a kernel to a slot. Returns (ok, info). Never raises."""
-    if not NGROK_TOKEN:
-        return False, {"error": "NGROK_AUTHTOKEN is not set on the server."}
+def push_slot(slot, minutes, gpu, preferred_token=None):
+    if not NGROK_TOKEN_1 or not NGROK_TOKEN_2:
+        return False, {"error": "Both NGROK_AUTHTOKEN_1 and NGROK_AUTHTOKEN_2 must be set."}
     if not slot["topic"]:
         return False, {"error": f"Topic for slot {slot['id']} is not set."}
     if not shutil.which("kaggle"):
@@ -386,15 +407,22 @@ def push_slot(slot, minutes, gpu):
         with slot["push_lock"]:
             if slot["pushed_at"]:
                 return False, {"error": "This slot was already pushed recently."}
-            code = build_kernel_code(slot["topic"], minutes)
+
+            token = claim_token(slot, preferred=preferred_token)
+            if not token:
+                return False, {"error": "No ngrok token free. Both slots are holding one."}
+
+            code = build_kernel_code(slot["topic"], minutes, token)
             write_kernel(code, gpu=gpu)
             rc, out = kaggle_cli("kernels", "push", "-p", str(BUILD),
                                  "-t", str(minutes * 60 + 300))
             if rc != 0:
+                slot["token"] = None
                 return False, {"error": f"Kaggle push failed: {out}"}
             slot["pushed_at"] = int(time.time())
             slot["stop_sent"] = False
-            return True, {"kaggle_output": out}
+            slot["hard_killed_at"] = 0
+            return True, {"kaggle_output": out, "token": token}
 
 
 def slot_link(slot):
@@ -423,6 +451,8 @@ def slot_state_dict(slot):
         "pushed_at": pushed or None,
         "age_seconds": age,
         "last_message": slot_last_message(slot),
+        "token": slot["token"],
+        "hard_killed_at": slot["hard_killed_at"] or None,
     }
 
 
@@ -443,6 +473,55 @@ def upgrades_remaining():
         cutoff = now - 24 * 3600
         UPGRADE_LOG[:] = [t for t in UPGRADE_LOG if t > cutoff]
         return GPU_DAILY_RUNS - len(UPGRADE_LOG)
+
+
+# ---------- hard kill ----------
+#
+# "Kill it, don't wait for it to stop". Send STOP twice, mark the slot as
+# killed. A kernel that already exited sees a STOP it ignores. A kernel that
+# is still alive gets it and shuts down within 15s (its watchdog polls every
+# 15 seconds and calls os._exit(0)).
+#
+# Verification is done by the caller: after hard_kill, we wait up to
+# KILL_VERIFY_SECONDS for the slot's link to disappear from ntfy (which
+# happens the moment the kernel posts STATUS finished) OR for it to go past
+# a generous timeout, whichever comes first. We don't block the rotator; the
+# rotator only checks `slot["pushed_at"]` before deciding to push again.
+
+KILL_VERIFY_SECONDS = 90
+
+def hard_kill_slot(slot):
+    """Send STOP, mark killed. Does not wait."""
+    with SLOTS_LOCK:
+        if slot["stop_sent"] and slot["pushed_at"] == 0:
+            return  # already killed
+        slot["stop_sent"] = True
+        slot["pushed_at"] = 0
+        slot["hard_killed_at"] = int(time.time())
+        try:
+            ntfy_send(slot["topic"], "STOP")
+        except Exception:
+            pass
+        # Second STOP after a short pause catches a kernel whose watchdog
+        # missed the first (network hiccup on the poll).
+        def second():
+            time.sleep(4)
+            try:
+                ntfy_send(slot["topic"], "STOP")
+            except Exception:
+                pass
+        threading.Thread(target=second, daemon=True).start()
+
+
+def confirm_dead(slot, timeout=KILL_VERIFY_SECONDS):
+    """Wait up to `timeout` seconds for the slot's link to clear.
+    Returns True if it cleared, False if the timeout hit."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if slot_link(slot) is None:
+            return True
+        time.sleep(3)
+    return False
 
 
 # ---------- current status ----------
@@ -475,10 +554,6 @@ def current_status():
 
     kaggle = run_state()
 
-    # Spare state, from the caller's point of view:
-    #   idle    -- never pushed, or stopped
-    #   booting -- pushed, no LINK yet
-    #   ready   -- LINK is live
     if cpu_spare["link"]:
         cpu_spare_state = "ready"
     elif cpu_spare["pushed_at"]:
@@ -493,10 +568,6 @@ def current_status():
     else:
         gpu_state = "idle"
 
-    # Top-level server state, for the frontend. One field, one meaning:
-    #   "online"  -- a link is live and requests will succeed
-    #   "booting" -- a push happened, waiting on LINK
-    #   "idle"    -- nothing is running and nothing is booting
     if link:
         server_state = "online"
     elif cpu_primary["pushed_at"] or cpu_spare["pushed_at"] or state_g["pushed_at"]:
@@ -521,26 +592,20 @@ def current_status():
         "gpu_upgrades_per_day": GPU_DAILY_RUNS,
         "last_message": last_msg,
         "last_message_age_seconds": None,
+        "cpu_a_token": state_a["token"],
+        "cpu_b_token": state_b["token"],
+        "gpu_token": state_g["token"],
     }
 
 
 def cached_status():
-    """Serve a cached status for STATUS_TTL_SECONDS.
-
-    current_status() makes four outbound calls. Doing that per request queues
-    up on Render's free tier because every polling tab is one caller. One
-    computation per TTL, shared by all callers, fixes it.
-    """
     now = time.time()
     with STATUS_CACHE_LOCK:
         value = STATUS_CACHE["value"]
         at = STATUS_CACHE["at"]
         if value is not None and (now - at) < STATUS_TTL_SECONDS:
             return value
-
-    # Compute outside the lock so a slow call doesn't block other readers.
     fresh = current_status()
-
     with STATUS_CACHE_LOCK:
         STATUS_CACHE["at"] = time.time()
         STATUS_CACHE["value"] = fresh
@@ -555,7 +620,24 @@ def _cpu_states():
 
 
 def cpu_rotator():
-    """Every 60s: make sure one CPU run is alive, and rotate before the cap."""
+    """
+    Handover rules, in order of precedence.
+
+    At CPU_SPARE_PREP_MIN (default 9h30m):
+        Push the spare on the other ngrok token. Both tunnels live at once.
+        Nothing is killed yet.
+
+    At CPU_KILL_OLD_MIN (default 10h):
+        Hard-kill the aging primary, no waiting. Verify death via ntfy.
+        The spare should already have a live LINK by now (30 minutes was
+        enough to boot). If it doesn't, the fresh CPU slot is on its own
+        and the link_watcher will retry.
+
+    If the GPU is running at CPU_SPARE_PREP_MIN:
+        Still prep the spare CPU on the token the GPU is NOT using. The GPU
+        continues serving on its token. When the CPU spare is live, we wait
+        for the GPU to hit its own cap and die, then the CPU becomes primary.
+    """
     while True:
         try:
             if not (TOPIC_A and TOPIC_B):
@@ -570,38 +652,71 @@ def cpu_rotator():
             spare_id = "cpu_b" if cpu_primary["id"] == "cpu_a" else "cpu_a"
             spare = SLOT_BY_ID[spare_id]
             spare_state = state_b if spare_id == "cpu_b" else state_a
+            primary_slot = SLOT_BY_ID[cpu_primary["id"]]
 
             primary_age_min = (
                 int((cpu_primary["age_seconds"] or 0) / 60)
                 if cpu_primary["age_seconds"] else 0
             )
 
-            # Branch A: nothing running at all, and nothing booting.
+            gpu = SLOT_BY_ID["gpu"]
+            gpu_state = slot_state_dict(gpu)
+            gpu_active = bool(gpu_state["link"]) or bool(gpu["pushed_at"])
+
+            # ---- bootstrap: nothing running at all ----
             if (not cpu_primary["link"]
                     and not cpu_primary["pushed_at"]
                     and not spare_state["pushed_at"]
                     and not spare_state["link"]):
-                push_slot(SLOT_BY_ID[cpu_primary["id"]], CPU_RUN_MINUTES, gpu=False)
+                push_slot(primary_slot, CPU_RUN_MINUTES, gpu=False,
+                          preferred_token=TOKEN_1)
                 time.sleep(60)
                 continue
 
-            # Branch C: spare is live -> promote, stop the old primary once.
+            # ---- spare live -> promote, kill the old primary now ----
+            # This runs on the tick after the spare posts its LINK.
             if spare_state["link"]:
-                primary_slot = SLOT_BY_ID[cpu_primary["id"]]
-                with SLOTS_LOCK:
-                    if not primary_slot["stop_sent"]:
-                        primary_slot["stop_sent"] = True
-                        try:
-                            ntfy_send(primary_slot["topic"], "STOP")
-                        except Exception:
-                            pass
+                if not primary_slot["stop_sent"]:
+                    hard_kill_slot(primary_slot)
                 time.sleep(60)
                 continue
 
-            # Branch B: primary is aging out and spare hasn't been pushed yet.
-            if (primary_age_min >= CPU_SWAP_AFTER_MIN
-                    and not spare_state["pushed_at"]):
-                push_slot(spare, CPU_RUN_MINUTES, gpu=False)
+            # ---- prep stage: push the spare at CPU_SPARE_PREP_MIN ----
+            if (primary_age_min >= CPU_SPARE_PREP_MIN
+                    and primary_age_min < CPU_KILL_OLD_MIN
+                    and not spare_state["pushed_at"]
+                    and not spare_state["link"]):
+
+                primary_token = cpu_primary.get("token")
+                preferred = TOKEN_2 if primary_token == TOKEN_1 else TOKEN_1
+
+                # GPU holds one token. If the GPU is on the primary's token,
+                # use the GPU's token for the CPU spare (the GPU will die on
+                # its own cap before the CPU needs to be primary). If the GPU
+                # is on the *other* token, use the primary's token-free side.
+                if gpu_active and gpu.get("token") == preferred:
+                    # The token we wanted is held by the GPU. Use whatever
+                    # the primary is holding — the primary is about to die
+                    # anyway, so its tunnel going down at 10h frees it.
+                    preferred = primary_token
+
+                ok, _ = push_slot(spare, CPU_RUN_MINUTES, gpu=False,
+                                  preferred_token=preferred)
+                if not ok:
+                    # No token free. Kill the primary now, free its token,
+                    # push the spare. Brief gap, unavoidable.
+                    hard_kill_slot(primary_slot)
+                    time.sleep(6)
+                    freed = primary_slot["token"]
+                    primary_slot["token"] = None
+                    push_slot(spare, CPU_RUN_MINUTES, gpu=False,
+                              preferred_token=freed)
+                time.sleep(60)
+                continue
+
+            # ---- kill stage: hard kill the primary at CPU_KILL_OLD_MIN ----
+            if primary_age_min >= CPU_KILL_OLD_MIN and not primary_slot["stop_sent"]:
+                hard_kill_slot(primary_slot)
                 time.sleep(60)
                 continue
 
@@ -611,25 +726,61 @@ def cpu_rotator():
 
 
 def gpu_watchdog():
-    """Every 60s: STOP the GPU run once it has lived GPU_RUN_MINUTES."""
+    """
+    Kill the GPU when it hits GPU_RUN_MINUTES, unless the CPU spare is not
+    yet live. In that case the GPU is allowed to keep serving up to
+    GPU_MAX_EXTENDED_MIN. The moment a CPU link appears, kill the GPU
+    immediately so the CPU takes over.
+    """
     while True:
         try:
             gpu = SLOT_BY_ID["gpu"]
             pushed = gpu["pushed_at"]
             if pushed and TOPIC_GPU:
                 elapsed_min = int((time.time() - pushed) / 60)
+
+                cpu_link_live = bool(
+                    slot_link(SLOT_BY_ID["cpu_a"]) or slot_link(SLOT_BY_ID["cpu_b"])
+                )
+
+                # Normal cap reached. If a CPU is already live, die now.
                 if elapsed_min >= GPU_RUN_MINUTES:
-                    with SLOTS_LOCK:
-                        if not gpu["stop_sent"]:
-                            gpu["stop_sent"] = True
-                            try:
-                                ntfy_send(gpu["topic"], "STOP")
-                            except Exception:
-                                pass
-                        gpu["pushed_at"] = 0
+                    if cpu_link_live:
+                        hard_kill_slot(gpu)
+                    else:
+                        # No CPU yet. Extend, but only to the hard ceiling.
+                        if elapsed_min >= GPU_MAX_EXTENDED_MIN:
+                            hard_kill_slot(gpu)
+                        else:
+                            # Stamp the hold time once so we can log it.
+                            if not GPU_HOLD_UNTIL["at"]:
+                                GPU_HOLD_UNTIL["at"] = int(time.time())
+                else:
+                    GPU_HOLD_UNTIL["at"] = 0
         except Exception:
             pass
         time.sleep(60)
+
+
+def link_watcher():
+    """Safety net. If no link and nothing booting, push a CPU on token 1."""
+    while True:
+        try:
+            state_a, state_b = _cpu_states()
+            gpu = slot_state_dict(SLOT_BY_ID["gpu"])
+
+            any_link = bool(state_a["link"] or state_b["link"] or gpu["link"])
+            any_push = bool(
+                state_a["pushed_at"] or state_b["pushed_at"] or gpu["pushed_at"]
+            )
+
+            if not any_link and not any_push:
+                cpu_primary = _pick_cpu_primary(state_a, state_b)
+                push_slot(SLOT_BY_ID[cpu_primary["id"]], CPU_RUN_MINUTES,
+                          gpu=False, preferred_token=TOKEN_1)
+        except Exception:
+            pass
+        time.sleep(30)
 
 
 # ---------- Applio proxy ----------
@@ -734,7 +885,8 @@ def start():
         return jsonify(ok=True, already_running=True, **cached_status())
 
     primary = _pick_cpu_primary(state_a, state_b)
-    ok, info = push_slot(SLOT_BY_ID[primary["id"]], CPU_RUN_MINUTES, gpu=False)
+    ok, info = push_slot(SLOT_BY_ID[primary["id"]], CPU_RUN_MINUTES,
+                         gpu=False, preferred_token=TOKEN_1)
     if not ok:
         return fail(info.get("error", "Push failed"), 500)
     return jsonify(ok=True, already_running=False,
@@ -747,20 +899,13 @@ def stop():
     if not TOPIC_A or not TOPIC_B or not TOPIC_GPU:
         return fail("One or more RVC_NTFY_TOPIC_* variables are missing.", 500)
 
-    with SLOTS_LOCK:
-        for slot in SLOTS:
-            try:
-                ntfy_send(slot["topic"], "STOP")
-            except Exception:
-                pass
-            slot["pushed_at"] = 0
-            slot["stop_sent"] = True
+    for slot in SLOTS:
+        hard_kill_slot(slot)
     CLIENT_CACHE.update(url=None, client=None, endpoints=None)
-    # Invalidate the cache so the next status reflects the stop immediately.
     with STATUS_CACHE_LOCK:
         STATUS_CACHE["value"] = None
         STATUS_CACHE["at"] = 0.0
-    return jsonify(ok=True, message="Stop signal sent to all slots.")
+    return jsonify(ok=True, message="Stop sent to all slots.")
 
 
 @app.post("/api/upgrade-gpu")
@@ -780,11 +925,16 @@ def upgrade_gpu():
     if not allowed:
         return fail(f"Daily GPU limit reached. Try again later. Remaining: {remaining}.", 429)
 
-    ok, info = push_slot(gpu, GPU_RUN_MINUTES, gpu=True)
+    cpu_primary = _pick_cpu_primary(*_cpu_states())
+    primary_token = cpu_primary.get("token")
+    preferred = TOKEN_2 if primary_token == TOKEN_1 else TOKEN_1
+
+    ok, info = push_slot(gpu, GPU_RUN_MINUTES, gpu=True, preferred_token=preferred)
     if not ok:
         return fail(info.get("error", "GPU push failed"), 500)
 
-    # Invalidate cache so the next status reflects the GPU boot.
+    GPU_HOLD_UNTIL["at"] = 0
+
     with STATUS_CACHE_LOCK:
         STATUS_CACHE["value"] = None
         STATUS_CACHE["at"] = 0.0
@@ -937,13 +1087,15 @@ def _boot():
             state_a, state_b = _cpu_states()
             primary = _pick_cpu_primary(state_a, state_b)
             if not primary["link"] and not primary["pushed_at"]:
-                push_slot(SLOT_BY_ID[primary["id"]], CPU_RUN_MINUTES, gpu=False)
+                push_slot(SLOT_BY_ID[primary["id"]], CPU_RUN_MINUTES,
+                          gpu=False, preferred_token=TOKEN_1)
         except Exception:
             pass
 
 
 threading.Thread(target=cpu_rotator, daemon=True).start()
 threading.Thread(target=gpu_watchdog, daemon=True).start()
+threading.Thread(target=link_watcher, daemon=True).start()
 threading.Thread(target=_boot, daemon=True).start()
 
 
